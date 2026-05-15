@@ -1143,13 +1143,21 @@ if (!function_exists('_bv_sb_release_one_row')) {
 // ---------------------------------------------------------------------------
 // Public: release pending balance for one specific order_item_id.
 //
-// Signature accepts seller_id + order_item_id + currency so callers can
-// target the exact ledger row. seller_id = 0 means "any seller" (legacy
-// single-arg behaviour is preserved when only $orderItemId is given).
+// Signature: (seller_id, order_item_id, currency='')
+// Legacy single-arg callers: bv_seller_balance_release_pending_by_order_item($itemId)
+//   are detected and handled automatically.
 //
-// Returns bool for backward compatibility:
+// Design: this wrapper is intentionally simple.
+//   - It finds the raw earning/sale_pending ledger row directly from seller_ledger.
+//   - No joins to orders/order_items. No fulfillment/status checks.
+//   - No fee-subtraction here; the release helper reads actual pending_balance
+//     with FOR UPDATE and caps the release there, so anti-negative is guaranteed.
+//   - Fee deductions were already applied when the order was paid (platform_fee
+//     debit to pending), so the live pending_balance already reflects net.
+//
+// Returns bool (backward-compatible):
 //   true  — released successfully (actual_released_amount > 0)
-//   false — not found, noop, inconsistency, or failure
+//   false — row not found, already released (noop), or failure
 // ---------------------------------------------------------------------------
 if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
     function bv_seller_balance_release_pending_by_order_item(
@@ -1157,25 +1165,25 @@ if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
         int    $orderItemId = 0,
         string $currency    = ''
     ): bool {
-        // Support legacy single-argument callers:
-        //   bv_seller_balance_release_pending_by_order_item($orderItemId)
-        // In that form $sellerId holds the item ID and $orderItemId is 0.
+        // Legacy single-argument support:
+        //   bv_seller_balance_release_pending_by_order_item($itemId)
+        // PHP puts $itemId into $sellerId; $orderItemId stays 0.
         if ($sellerId > 0 && $orderItemId === 0) {
             $orderItemId = $sellerId;
             $sellerId    = 0;
         }
 
         if ($orderItemId <= 0) {
-            bv_seller_balance_log('pending_release_by_order_item_failed', [
-                'seller_id'      => $sellerId,
-                'order_item_id'  => $orderItemId,
-                'currency'       => $currency,
-                'reason'         => 'invalid_order_item_id',
+            bv_seller_balance_log('release_pending_wrapper_started', [
+                'seller_id'     => $sellerId,
+                'order_item_id' => $orderItemId,
+                'currency'      => $currency,
+                'error'         => 'invalid_order_item_id',
             ]);
             return false;
         }
 
-        bv_seller_balance_log('pending_release_by_order_item_started', [
+        bv_seller_balance_log('release_pending_wrapper_started', [
             'seller_id'     => $sellerId,
             'order_item_id' => $orderItemId,
             'currency'      => $currency,
@@ -1183,133 +1191,117 @@ if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
 
         $pdo = bv_seller_balance_pdo();
 
-        // Build optional WHERE clauses for seller and currency.
-        $sellerClause   = $sellerId > 0 ? ' AND sl.seller_id = ?' : '';
-        $currencyClause = ($currency !== '') ? ' AND sl.currency = ?' : '';
+        // ── Direct seller_ledger lookup ──────────────────────────────────────
+        // Pure ledger query: no order/order_item joins, no eligibility gates.
+        // seller_id and currency are optional narrow filters.
+        $where  = [
+            "type           IN ('earning', 'sale_pending')",
+            "balance_type   = 'pending'",
+            "direction      = 'credit'",
+            "reference_type = 'order_item'",
+            'reference_id   = ?',
+        ];
+        $params = [$orderItemId];
 
-        // Fee sub-query also scoped to seller when provided.
-        $feeSellerClause = $sellerId > 0 ? ' AND seller_id = ?' : '';
+        if ($sellerId > 0) {
+            $where[]  = 'seller_id = ?';
+            $params[] = $sellerId;
+        }
+        if ($currency !== '') {
+            $where[]  = 'currency = ?';
+            $params[] = $currency;
+        }
 
-        $sql = "SELECT sl.seller_id,
-                       sl.reference_id                                          AS order_item_id,
-                       sl.currency,
-                       COALESCE(oi.order_id, 0)                                AS order_id,
-                       COALESCE(o.order_code, '')                              AS order_code,
-                       COALESCE(sl.amount, 0)                                  AS gross_amount,
-                       COALESCE(fee.fee_amount, 0)                             AS fee_amount,
-                       COALESCE(sl.amount, 0) - COALESCE(fee.fee_amount, 0)   AS net_amount
-                FROM seller_ledger sl
-                LEFT JOIN order_items oi ON oi.id = sl.reference_id
-                LEFT JOIN orders      o  ON o.id  = oi.order_id
-                LEFT JOIN (
-                    SELECT seller_id, reference_id, SUM(amount) AS fee_amount
-                    FROM seller_ledger
-                    WHERE type           = 'platform_fee'
-                      AND balance_type   = 'pending'
-                      AND direction      = 'debit'
-                      AND reference_type = 'order_item'
-                      AND reference_id   = ?
-                      {$feeSellerClause}
-                    GROUP BY seller_id, reference_id
-                ) fee ON fee.seller_id = sl.seller_id AND fee.reference_id = sl.reference_id
-                WHERE sl.type           IN ('earning', 'sale_pending')
-                  AND sl.balance_type   = 'pending'
-                  AND sl.direction      = 'credit'
-                  AND sl.reference_type = 'order_item'
-                  AND sl.reference_id   = ?
-                  {$sellerClause}
-                  {$currencyClause}
-                LIMIT 1";
-
-        // Bind params: fee sub-query reference_id first, then main WHERE.
-        $params = [$orderItemId];                      // fee sub-query reference_id
-        if ($sellerId > 0) { $params[] = $sellerId; } // fee sub-query seller_id
-        $params[] = $orderItemId;                      // main WHERE reference_id
-        if ($sellerId > 0) { $params[] = $sellerId; } // main WHERE seller_id
-        if ($currency !== '') { $params[] = $currency; } // main WHERE currency
+        $sql = 'SELECT seller_id,
+                       reference_id AS order_item_id,
+                       amount,
+                       amount       AS net_amount,
+                       amount       AS gross_amount,
+                       0.0          AS fee_amount,
+                       currency,
+                       0            AS order_id,
+                       \'\'         AS order_code
+                FROM seller_ledger
+                WHERE ' . implode("\n                  AND ", $where) . '
+                ORDER BY id ASC
+                LIMIT 1';
 
         try {
             $stmt = $pdo->prepare($sql);
             $stmt->execute($params);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
         } catch (Throwable $e) {
-            bv_seller_balance_log('pending_release_by_order_item_failed', [
+            bv_seller_balance_log('release_pending_wrapper_no_row', [
                 'seller_id'     => $sellerId,
                 'order_item_id' => $orderItemId,
                 'currency'      => $currency,
                 'reason'        => 'query_error',
                 'error'         => $e->getMessage(),
             ]);
-            error_log('[seller_balance] release_pending_by_order_item query failed: ' . $e->getMessage());
+            error_log('[seller_balance] release_pending_by_order_item query: ' . $e->getMessage());
             return false;
         }
 
-        if (!$row) {
-            bv_seller_balance_log('pending_release_by_order_item_failed', [
+        if (!$row || round((float)($row['amount'] ?? 0), 4) <= 0) {
+            bv_seller_balance_log('release_pending_wrapper_no_row', [
                 'seller_id'     => $sellerId,
                 'order_item_id' => $orderItemId,
                 'currency'      => $currency,
-                'reason'        => 'ledger_row_not_found',
-                'debug'         => 'No pending earning/sale_pending credit row found in seller_ledger.',
+                'row_found'     => !empty($row),
+                'amount'        => round((float)($row['amount'] ?? 0), 4),
+                'debug'         => 'No pending earning/sale_pending credit row found in seller_ledger '
+                                 . 'for reference_id=' . $orderItemId
+                                 . ($sellerId > 0 ? ' seller_id=' . $sellerId : '')
+                                 . ($currency !== '' ? ' currency=' . $currency : '') . '.',
             ]);
             return false;
         }
 
-        $netAmount = round((float)($row['net_amount'] ?? 0), 4);
-        if ($netAmount <= 0) {
-            bv_seller_balance_log('pending_release_by_order_item_noop', [
-                'seller_id'     => (int)($row['seller_id'] ?? $sellerId),
-                'order_item_id' => $orderItemId,
-                'currency'      => (string)($row['currency'] ?? $currency),
-                'reason'        => 'net_amount_zero_or_negative',
-                'gross_amount'  => (float)($row['gross_amount'] ?? 0),
-                'fee_amount'    => (float)($row['fee_amount'] ?? 0),
-                'net_amount'    => $netAmount,
-            ]);
-            return false;
-        }
+        bv_seller_balance_log('release_pending_wrapper_found_row', [
+            'seller_id'     => (int)$row['seller_id'],
+            'order_item_id' => $orderItemId,
+            'currency'      => (string)$row['currency'],
+            'amount'        => round((float)$row['amount'], 4),
+        ]);
 
-        // Delegate to the public row-level function (returns detail array).
+        // ── Delegate to public row-level release function ────────────────────
+        // release_pending_for_row() → _bv_sb_release_one_row():
+        //   - Checks both old+new idempotency key formats (noop if already done)
+        //   - Locks seller_balances FOR UPDATE
+        //   - Caps release at actual pending_balance (anti-negative)
+        //   - Inserts paired ledger rows atomically
+        //   - Returns detail array
         try {
             $result = bv_seller_balance_release_pending_for_row($row);
         } catch (Throwable $e) {
-            bv_seller_balance_log('pending_release_by_order_item_failed', [
-                'seller_id'     => (int)($row['seller_id'] ?? $sellerId),
+            bv_seller_balance_log('release_pending_wrapper_result', [
+                'seller_id'     => (int)$row['seller_id'],
                 'order_item_id' => $orderItemId,
-                'currency'      => (string)($row['currency'] ?? $currency),
-                'reason'        => 'release_exception',
+                'ok'            => false,
                 'error'         => $e->getMessage(),
             ]);
             error_log('[seller_balance] release_pending_by_order_item #' . $orderItemId . ': ' . $e->getMessage());
             return false;
         }
 
-        $ok       = $result['ok'] ?? false;
-        $released = (float)($result['actual_released_amount'] ?? 0);
-        $noop     = (bool)($result['noop'] ?? false);
+        $ok       = (bool)($result['ok']                     ?? false);
+        $released = round((float)($result['actual_released_amount'] ?? 0), 4);
+        $noop     = (bool)($result['noop']                   ?? false);
 
-        if ($ok && $released > 0) {
-            bv_seller_balance_log('pending_release_by_order_item_success', [
-                'seller_id'              => $result['seller_id']              ?? $sellerId,
-                'order_item_id'          => $orderItemId,
-                'currency'               => (string)($row['currency'] ?? $currency),
-                'actual_released_amount' => $released,
-                'shortfall'              => $result['shortfall'] ?? 0.0,
-                'debit_ledger_id'        => $result['debit_ledger_id']  ?? null,
-                'credit_ledger_id'       => $result['credit_ledger_id'] ?? null,
-            ]);
-            return true;
-        }
-
-        bv_seller_balance_log('pending_release_by_order_item_noop', [
-            'seller_id'     => $result['seller_id'] ?? $sellerId,
-            'order_item_id' => $orderItemId,
-            'currency'      => (string)($row['currency'] ?? $currency),
-            'ok'            => $ok,
-            'noop'          => $noop,
-            'message'       => $result['message'] ?? '',
+        bv_seller_balance_log('release_pending_wrapper_result', [
+            'seller_id'              => $result['seller_id']       ?? (int)$row['seller_id'],
+            'order_item_id'          => $orderItemId,
+            'currency'               => (string)$row['currency'],
+            'ok'                     => $ok,
+            'noop'                   => $noop,
+            'actual_released_amount' => $released,
+            'shortfall'              => round((float)($result['shortfall'] ?? 0), 4),
+            'debit_ledger_id'        => $result['debit_ledger_id']  ?? null,
+            'credit_ledger_id'       => $result['credit_ledger_id'] ?? null,
+            'message'                => $result['message']          ?? '',
         ]);
-        return false;
+
+        return $ok && $released > 0;
     }
 }
 
@@ -1546,12 +1538,20 @@ if (!function_exists('bv_seller_balance_release_pending')) {
 if (!function_exists('bv_seller_balance_request_payout')) {
     /**
      * Seller requests a payout from available_balance.
-     * Moves amount: available_balance -> held_balance.
+     * Moves amount: available_balance → held_balance atomically.
+     *
+     * Returns a structured array on success; throws RuntimeException on failure.
+     * The array is truthy, so existing callers using if (result) still work.
+     * Callers needing the payout_request_id should use $result['payout_request_id'].
+     *
+     * Ledger types written:
+     *   payout_hold_debit   (available, debit)  idempotency: payout_hold_debit:{id}
+     *   payout_hold_credit  (held, credit)       idempotency: payout_hold_credit:{id}
      */
-    function bv_seller_balance_request_payout(int $sellerId, float $amount, array $details = []): int
+    function bv_seller_balance_request_payout(int $sellerId, float $amount, array $details = []): array
     {
         if ($sellerId <= 0 || $amount <= 0) {
-            return 0;
+            throw new RuntimeException('Invalid seller_id or amount for payout request.');
         }
 
         $minAmount = (float)bv_seller_balance_get_setting('payout_min_amount', '10.00');
@@ -1561,18 +1561,18 @@ if (!function_exists('bv_seller_balance_request_payout')) {
         if (bv_seller_balance_get_setting('payout_enabled', '1') !== '1') {
             throw new RuntimeException('Payout requests are temporarily disabled.');
         }
-		
+
         $method = (string)($details['payout_method'] ?? '');
         $allowedMethods = ['promptpay', 'bank_transfer', 'wise', 'other'];
         if (!in_array($method, $allowedMethods, true)) {
             throw new RuntimeException('Invalid payout method.');
         }
 
-        $bankName = trim((string)($details['bank_name'] ?? ''));
+        $bankName          = trim((string)($details['bank_name']           ?? ''));
         $bankAccountNumber = trim((string)($details['bank_account_number'] ?? ''));
-        $bankAccountName = trim((string)($details['bank_account_name'] ?? ''));
-        $promptpay = preg_replace('/\D+/', '', (string)($details['promptpay_number'] ?? ''));
-        $sellerNote = trim((string)($details['seller_note'] ?? ''));
+        $bankAccountName   = trim((string)($details['bank_account_name']   ?? ''));
+        $promptpay         = preg_replace('/\D+/', '', (string)($details['promptpay_number'] ?? ''));
+        $sellerNote        = trim((string)($details['seller_note']          ?? ''));
 
         if ($method === 'promptpay' && !in_array(strlen($promptpay), [10, 13], true)) {
             throw new RuntimeException('PromptPay number must contain 10 or 13 digits.');
@@ -1586,36 +1586,55 @@ if (!function_exists('bv_seller_balance_request_payout')) {
             if ($sellerNote === '' && trim((string)($details['wise_email'] ?? '')) === '') {
                 throw new RuntimeException('Wise payout requires a note or email for destination details.');
             }
-        }		
+        }
+
+        bv_seller_balance_log('payout_request_started', [
+            'seller_id' => $sellerId,
+            'amount'    => $amount,
+            'method'    => $method,
+        ]);
 
         $pdo = bv_seller_balance_pdo();
         try {
             $pdo->beginTransaction();
 
+            // Lock seller_balances row.
             $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
             $balRow->execute([$sellerId]);
             $balance = $balRow->fetch(PDO::FETCH_ASSOC);
             if (!$balance) {
                 $pdo->rollBack();
-                throw new RuntimeException('No balance record found for seller.');
+                throw new RuntimeException('No balance record found for seller #' . $sellerId . '.');
             }
 
-            $currency = (string)($balance['currency'] ?? 'USD');
-          $requestCurrency = strtoupper((string)($details['currency'] ?? $currency));
+            $currency        = (string)($balance['currency'] ?? 'USD');
+            $requestCurrency = strtoupper(trim((string)($details['currency'] ?? $currency)));
             if ($requestCurrency !== '' && strtoupper($currency) !== $requestCurrency) {
                 $pdo->rollBack();
                 throw new RuntimeException('Currency mismatch for payout request.');
             }
-			
-            $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
-            $heldNow = round((float)($balance['held_balance'] ?? 0), 4);
-            $requestAmt = round($amount, 4);
 
-            if ($requestAmt <= 0 || $requestAmt > $availableNow) { 
+            $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
+            $heldNow      = round((float)($balance['held_balance']      ?? 0), 4);
+            $requestAmt   = round($amount, 4);
+
+            // Sufficient available balance check.
+            if ($requestAmt > $availableNow) {
                 $pdo->rollBack();
-                throw new RuntimeException('Requested amount exceeds available balance. Available: ' . number_format($availableNow, 2));
+                bv_seller_balance_log('payout_request_insufficient_balance', [
+                    'seller_id'     => $sellerId,
+                    'requested'     => $requestAmt,
+                    'available_now' => $availableNow,
+                ]);
+                throw new RuntimeException(
+                    'Requested amount exceeds available balance. Available: ' . number_format($availableNow, 2)
+                );
             }
 
+            // Anti-negative guard.
+            _bv_sb_guard_no_negative($availableNow, $requestAmt, 'payout_request seller #' . $sellerId);
+
+            // One open payout at a time.
             $openStmt = $pdo->prepare(
                 "SELECT id FROM seller_payout_requests
                  WHERE seller_id = ? AND status IN ('requested','approved')
@@ -1627,85 +1646,121 @@ if (!function_exists('bv_seller_balance_request_payout')) {
                 throw new RuntimeException('You already have an open payout request. Please wait for it to be processed.');
             }
 
+            // Insert payout request row.
             $pdo->prepare(
                 'INSERT INTO seller_payout_requests
                  (seller_id, amount, currency, status, bank_name, bank_account_number,
-                  bank_account_name, promptpay_number, payout_method, seller_note)
+                  bank_account_name, promptpay_number, payout_method, seller_note, requested_at)
                  VALUES
-                 (:sid, :amt, :cur, :status, :bank, :acct, :acct_name, :pp, :method, :note)'
+                 (:sid, :amt, :cur, :status, :bank, :acct, :acct_name, :pp, :method, :note, NOW())'
             )->execute([
-                ':sid' => $sellerId,
-                ':amt' => $requestAmt,
-                ':cur' => $currency,
-                ':status' => 'requested',
-                ':bank' => $method === 'bank_transfer' ? $bankName : null,
-                ':acct' => $method === 'bank_transfer' ? $bankAccountNumber : null,
+                ':sid'       => $sellerId,
+                ':amt'       => $requestAmt,
+                ':cur'       => $currency,
+                ':status'    => 'requested',
+                ':bank'      => $method === 'bank_transfer' ? $bankName : null,
+                ':acct'      => $method === 'bank_transfer' ? $bankAccountNumber : null,
                 ':acct_name' => $method === 'bank_transfer' ? $bankAccountName : null,
-                ':pp' => $method === 'promptpay' ? $promptpay : null,
-                ':method' => $method,
-                ':note' => $sellerNote,
+                ':pp'        => $method === 'promptpay' ? $promptpay : null,
+                ':method'    => $method,
+                ':note'      => $sellerNote,
             ]);
             $payoutRequestId = (int)$pdo->lastInsertId();
-			
+
             $metaBase = _bv_sb_request_context_meta() + [
-                'action' => 'payout_request',
-                'payout_request_id' => $payoutRequestId,
-                'seller_id' => $sellerId,
-                'old_status' => null,
-                'new_status' => 'requested',
-                'payment_method' => $method,
-                'payment_reference' => null,
+                'action'             => 'payout_request',
+                'payout_request_id'  => $payoutRequestId,
+                'seller_id'          => $sellerId,
+                'old_status'         => null,
+                'new_status'         => 'requested',
+                'payment_method'     => $method,
+                'payment_reference'  => null,
             ];
 
-            _bv_sb_insert_ledger_once($pdo, [
-                'seller_id' => $sellerId,
-                'type' => 'payout_request',
-                'balance_type' => 'available',
-                'direction' => 'debit',
-                'amount' => $requestAmt,
-                'currency' => $currency,
-                'balance_before' => $availableNow,
-                'balance_after' => round($availableNow - $requestAmt, 4),
-                'reference_type' => 'payout_request',
-                'reference_id' => $payoutRequestId,
-                'idempotency_key' => 'payout_request_available:' . $payoutRequestId,
-                'note' => 'Payout request #' . $payoutRequestId,
-                'meta_json' => $metaBase,
+            // Ledger: debit available (payout_hold_debit).
+            $debitKey = 'payout_hold_debit:' . $payoutRequestId;
+            $debitLedgerId = _bv_sb_insert_ledger_once($pdo, [
+                'seller_id'       => $sellerId,
+                'type'            => 'payout_hold_debit',
+                'balance_type'    => 'available',
+                'direction'       => 'debit',
+                'amount'          => $requestAmt,
+                'currency'        => $currency,
+                'balance_before'  => $availableNow,
+                'balance_after'   => round($availableNow - $requestAmt, 4),
+                'reference_type'  => 'payout_request',
+                'reference_id'    => $payoutRequestId,
+                'idempotency_key' => $debitKey,
+                'note'            => 'Payout request #' . $payoutRequestId . ' — hold debit',
+                'meta_json'       => $metaBase,
                 'created_by_type' => $details['created_by_type'] ?? 'seller',
-                'created_by_id' => $details['created_by_id'] ?? $sellerId,
+                'created_by_id'   => $details['created_by_id']   ?? $sellerId,
             ]);
 
-            _bv_sb_insert_ledger_once($pdo, [
-                'seller_id' => $sellerId,
-                'type' => 'payout_request',
-                'balance_type' => 'held',
-                'direction' => 'credit',
-                'amount' => $requestAmt,
-                'currency' => $currency,
-                'balance_before' => $heldNow,
-                'balance_after' => round($heldNow + $requestAmt, 4),
-                'reference_type' => 'payout_request',
-                'reference_id' => $payoutRequestId,
-                'idempotency_key' => 'payout_request_held:' . $payoutRequestId,
-                'note' => 'Payout request #' . $payoutRequestId . ' held',
-                 'meta_json' => $metaBase,
+            // Ledger: credit held (payout_hold_credit).
+            $creditKey = 'payout_hold_credit:' . $payoutRequestId;
+            $creditLedgerId = _bv_sb_insert_ledger_once($pdo, [
+                'seller_id'       => $sellerId,
+                'type'            => 'payout_hold_credit',
+                'balance_type'    => 'held',
+                'direction'       => 'credit',
+                'amount'          => $requestAmt,
+                'currency'        => $currency,
+                'balance_before'  => $heldNow,
+                'balance_after'   => round($heldNow + $requestAmt, 4),
+                'reference_type'  => 'payout_request',
+                'reference_id'    => $payoutRequestId,
+                'idempotency_key' => $creditKey,
+                'note'            => 'Payout request #' . $payoutRequestId . ' — hold credit',
+                'meta_json'       => $metaBase,
                 'created_by_type' => $details['created_by_type'] ?? 'seller',
-                'created_by_id' => $details['created_by_id'] ?? $sellerId,
+                'created_by_id'   => $details['created_by_id']   ?? $sellerId,
             ]);
 
+            // Update snapshot.
             $pdo->prepare(
                 'UPDATE seller_balances
                  SET available_balance = available_balance - :amt,
-                     held_balance = held_balance + :amt
+                     held_balance      = held_balance      + :amt
                  WHERE seller_id = :sid'
             )->execute([':amt' => $requestAmt, ':sid' => $sellerId]);
 
             $pdo->commit();
-            return $payoutRequestId;
+
+            // Re-read updated snapshot.
+            $snapStmt = $pdo->prepare(
+                'SELECT available_balance, held_balance FROM seller_balances WHERE seller_id = ? LIMIT 1'
+            );
+            $snapStmt->execute([$sellerId]);
+            $newSnap = $snapStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+
+            bv_seller_balance_log('payout_request_created', [
+                'seller_id'         => $sellerId,
+                'payout_request_id' => $payoutRequestId,
+                'amount'            => $requestAmt,
+                'currency'          => $currency,
+                'method'            => $method,
+                'debit_ledger_id'   => $debitLedgerId,
+                'credit_ledger_id'  => $creditLedgerId,
+            ]);
+
+            return [
+                'ok'                => true,
+                'payout_request_id' => $payoutRequestId,
+                'amount'            => $requestAmt,
+                'currency'          => $currency,
+                'debit_ledger_id'   => $debitLedgerId,
+                'credit_ledger_id'  => $creditLedgerId,
+                'balance'           => $newSnap,
+            ];
+
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('payout_request_failed', [
+                'seller_id' => $sellerId,
+                'amount'    => $amount,
+                'error'     => $e->getMessage(),
+            ]);
             throw $e;
         }
     }
@@ -1715,11 +1770,15 @@ if (!function_exists('bv_seller_balance_request_payout')) {
 // ---------------------------------------------------------------------------
 
 if (!function_exists('bv_seller_balance_approve_payout')) {
-    function bv_seller_balance_approve_payout(int $payoutId, int $adminId, string $note = ''): bool
+    function bv_seller_balance_approve_payout(int $payoutId, int $adminId, string $note = ''): array|false
     {
         if ($payoutId <= 0) {
             return false;
         }
+        bv_seller_balance_log('payout_approve_started', [
+            'payout_id' => $payoutId,
+            'admin_id'  => $adminId,
+        ]);
         $pdo = bv_seller_balance_pdo();
         try {
             $pdo->beginTransaction();
@@ -1730,23 +1789,30 @@ if (!function_exists('bv_seller_balance_approve_payout')) {
                 $pdo->rollBack();
                 return false;
             }
-			
-           $sellerId = (int)$req['seller_id'];
-            $balRow = $pdo->prepare('SELECT seller_id FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
+
+            $sellerId = (int)$req['seller_id'];
+            $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
             $balRow->execute([$sellerId]);
-            if (!$balRow->fetch(PDO::FETCH_ASSOC)) {
+            $balSnap = $balRow->fetch(PDO::FETCH_ASSOC);
+            if (!$balSnap) {
                 $pdo->rollBack();
                 return false;
             }
-			
+
             if ((string)$req['status'] === 'approved') {
                 $pdo->commit();
-                return true;
+                bv_seller_balance_log('payout_approve_completed', [
+                    'payout_id' => $payoutId,
+                    'admin_id'  => $adminId,
+                    'noop'      => true,
+                ]);
+                return ['ok' => true, 'noop' => true, 'payout_request_id' => $payoutId,
+                        'status' => 'approved', 'balance' => $balSnap];
             }
             if ((string)$req['status'] !== 'requested') {
                 $pdo->rollBack();
                 return false;
-			}
+            }
 
             $set = ["status = 'approved'", "admin_note = CONCAT(COALESCE(admin_note,''), :note)"];
             if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'approved_at')) {
@@ -1767,11 +1833,23 @@ if (!function_exists('bv_seller_balance_approve_payout')) {
             ]);
 			
             $pdo->commit();
-            return true;
+            // Re-read snapshot after commit for the return value.
+            $snapStmt = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1');
+            $snapStmt->execute([$sellerId]);
+            $balSnap = $snapStmt->fetch(PDO::FETCH_ASSOC) ?: $balSnap;
+            bv_seller_balance_log('payout_approve_completed', [
+                'payout_id'  => $payoutId,
+                'admin_id'   => $adminId,
+                'seller_id'  => $sellerId,
+                'old_status' => 'requested',
+                'new_status' => 'approved',
+            ]);
+            return ['ok' => true, 'noop' => false, 'payout_request_id' => $payoutId,
+                    'status' => 'approved', 'balance' => $balSnap];
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('payout_failed', ['context' => 'approve_payout',
+                'payout_id' => $payoutId, 'error' => $e->getMessage()]);
             error_log('[seller_balance] approve_payout #' . $payoutId . ': ' . $e->getMessage());
             return false;
         }
@@ -1779,11 +1857,20 @@ if (!function_exists('bv_seller_balance_approve_payout')) {
 }
 
 if (!function_exists('bv_seller_balance_reject_payout')) {
+    /**
+     * Reject a payout request and return held funds → available.
+     * Ledger types: payout_reject_held_debit / payout_reject_available_credit
+     * Checks both new and legacy idempotency key formats.
+     */
     function bv_seller_balance_reject_payout(int $payoutId, int $adminId, string $note = ''): bool
     {
         if ($payoutId <= 0) {
             return false;
         }
+        bv_seller_balance_log('payout_reject_started', [
+            'payout_id' => $payoutId,
+            'admin_id'  => $adminId,
+        ]);
         $pdo = bv_seller_balance_pdo();
         try {
             $pdo->beginTransaction();
@@ -1796,18 +1883,23 @@ if (!function_exists('bv_seller_balance_reject_payout')) {
             }
             if ((string)$req['status'] === 'rejected') {
                 $pdo->commit();
-                return true;
+                return true; // idempotent
             }
-            if (!in_array((string)$req['status'], ['requested','approved'], true)) {
+            if (!in_array((string)$req['status'], ['requested', 'approved'], true)) {
                 $pdo->rollBack();
                 return false;
             }
 
-            $sellerId = (int)$req['seller_id'];
-            $amount = round((float)$req['amount'], 4);
-            $currency = (string)$req['currency'];
-            $heldKey = 'payout_reject_held:' . $payoutId;
-            $availableKey = 'payout_reject_available:' . $payoutId;
+            $sellerId     = (int)$req['seller_id'];
+            $amount       = round((float)$req['amount'], 4);
+            $currency     = (string)$req['currency'];
+
+            // New canonical idempotency keys.
+            $heldKeyNew      = 'payout_reject_held_debit:'       . $payoutId;
+            $availableKeyNew = 'payout_reject_available_credit:' . $payoutId;
+            // Legacy keys (from earlier patch revision).
+            $heldKeyOld      = 'payout_reject_held:'      . $payoutId;
+            $availableKeyOld = 'payout_reject_available:' . $payoutId;
 
             $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
             $balRow->execute([$sellerId]);
@@ -1817,67 +1909,94 @@ if (!function_exists('bv_seller_balance_reject_payout')) {
                 return false;
             }
 
-            $heldNow = round((float)($balance['held_balance'] ?? 0), 4);
+            $heldNow      = round((float)($balance['held_balance']      ?? 0), 4);
             $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
+
             if ($amount > $heldNow) {
                 $pdo->rollBack();
                 throw new RuntimeException('Held balance is lower than payout amount; cannot reject safely.');
             }
 
-             $metaBase = _bv_sb_request_context_meta() + [
-                'action' => 'payout_reject',
+            $metaBase = _bv_sb_request_context_meta() + [
+                'action'            => 'payout_reject',
                 'payout_request_id' => $payoutId,
-                'admin_id' => $adminId,
-                'old_status' => (string)$req['status'],
-                'new_status' => 'rejected',
-                'payment_method' => (string)($req['payout_method'] ?? ''),
+                'admin_id'          => $adminId,
+                'old_status'        => (string)$req['status'],
+                'new_status'        => 'rejected',
+                'payment_method'    => (string)($req['payout_method'] ?? ''),
                 'payment_reference' => null,
             ];
 
-            if ($amount > 0 && !_bv_sb_ledger_exists($pdo, $heldKey) && !_bv_sb_ledger_exists($pdo, $availableKey)) {
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id' => $sellerId,
-                    'type' => 'payout_cancelled',
-                    'balance_type' => 'held',
-                    'direction' => 'debit',
-                    'amount' => $amount,
-                    'currency' => $currency,
-                    'balance_before' => $heldNow,
-					'balance_after' => round($heldNow - $amount, 4),
-                    'reference_type' => 'payout_request',
-                    'reference_id' => $payoutId,
-                    'idempotency_key' => $heldKey,
-                    'note' => 'Payout #' . $payoutId . ' rejected - returned to available',
-                    'meta_json' => $metaBase,					
-                    'created_by_type' => 'admin',
-                    'created_by_id' => $adminId,
-                ]);
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id' => $sellerId,
-                    'type' => 'payout_cancelled',
-                    'balance_type' => 'available',
-                    'direction' => 'credit',
-                    'amount' => $amount,
-                    'currency' => $currency,
-                    'balance_before' => $availableNow,
-                    'balance_after' => round($availableNow + $amount, 4),
-                    'reference_type' => 'payout_request',
-                    'reference_id' => $payoutId,
-                    'idempotency_key' => $availableKey,
-                    'note' => 'Payout #' . $payoutId . ' rejected - returned to available',
-                    'meta_json' => $metaBase,
-                    'created_by_type' => 'admin',
-                    'created_by_id' => $adminId,
-                ]);
-                $pdo->prepare(
-                    'UPDATE seller_balances
-                     SET held_balance = held_balance - :amt,
-                         available_balance = available_balance + :amt
-                     WHERE seller_id = :sid'
-                )->execute([':amt' => $amount, ':sid' => $sellerId]);
+            if ($amount > 0) {
+                $heldExists      = _bv_sb_ledger_exists($pdo, $heldKeyNew)
+                                || _bv_sb_ledger_exists($pdo, $heldKeyOld);
+                $availableExists = _bv_sb_ledger_exists($pdo, $availableKeyNew)
+                                || _bv_sb_ledger_exists($pdo, $availableKeyOld);
+
+                if ($heldExists && $availableExists) {
+                    // Both reversal rows already written — noop on ledger/balance.
+                } elseif ($heldExists xor $availableExists) {
+                    $pdo->rollBack();
+                    bv_seller_balance_log('payout_ledger_inconsistent', [
+                        'payout_id'       => $payoutId,
+                        'held_exists'     => $heldExists,
+                        'available_exists'=> $availableExists,
+                        'context'         => 'reject',
+                    ]);
+                    bv_seller_balance_log('payout_inconsistent_ledger', [
+                        'payout_id' => $payoutId, 'context' => 'reject']);
+                    throw new RuntimeException(
+                        '[seller_balance] Payout ledger inconsistency on reject #' . $payoutId
+                        . ': exactly one of held/available reversal entries exists. Manual review required.'
+                    );
+                } else {
+                    // Neither exists — insert both.
+                    _bv_sb_guard_no_negative($heldNow, $amount, 'payout_reject held seller #' . $sellerId);
+
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'payout_reject',
+                        'balance_type'    => 'held',
+                        'direction'       => 'debit',
+                        'amount'          => $amount,
+                        'currency'        => $currency,
+                        'balance_before'  => $heldNow,
+                        'balance_after'   => round($heldNow - $amount, 4),
+                        'reference_type'  => 'payout_request',
+                        'reference_id'    => $payoutId,
+                        'idempotency_key' => $heldKeyNew,
+                        'note'            => 'Payout #' . $payoutId . ' rejected — returned to available',
+                        'meta_json'       => $metaBase,
+                        'created_by_type' => 'admin',
+                        'created_by_id'   => $adminId,
+                    ]);
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'payout_reject',
+                        'balance_type'    => 'available',
+                        'direction'       => 'credit',
+                        'amount'          => $amount,
+                        'currency'        => $currency,
+                        'balance_before'  => $availableNow,
+                        'balance_after'   => round($availableNow + $amount, 4),
+                        'reference_type'  => 'payout_request',
+                        'reference_id'    => $payoutId,
+                        'idempotency_key' => $availableKeyNew,
+                        'note'            => 'Payout #' . $payoutId . ' rejected — returned to available',
+                        'meta_json'       => $metaBase,
+                        'created_by_type' => 'admin',
+                        'created_by_id'   => $adminId,
+                    ]);
+                    $pdo->prepare(
+                        'UPDATE seller_balances
+                         SET held_balance      = held_balance      - :amt,
+                             available_balance = available_balance + :amt
+                         WHERE seller_id = :sid'
+                    )->execute([':amt' => $amount, ':sid' => $sellerId]);
+                }
             }
 
-             $set = ["status = 'rejected'", "admin_note = CONCAT(COALESCE(admin_note,''), :note)"];
+            $set = ["status = 'rejected'", "admin_note = CONCAT(COALESCE(admin_note,''), :note)"];
             if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'rejected_at')) {
                 $set[] = 'rejected_at = COALESCE(rejected_at, NOW())';
             }
@@ -1890,17 +2009,23 @@ if (!function_exists('bv_seller_balance_reject_payout')) {
             $sql = 'UPDATE seller_payout_requests SET ' . implode(', ', $set) . ' WHERE id = :id';
             $pdo->prepare($sql)->execute([
                 ':admin_id' => $adminId,
-                ':note' => "
+                ':note'     => "
 [Rejected] " . ($note ?: 'No reason given'),
-                ':id' => $payoutId,
+                ':id'       => $payoutId,
             ]);
 
             $pdo->commit();
+            bv_seller_balance_log('payout_reject_completed', [
+                'payout_id'  => $payoutId,
+                'admin_id'   => $adminId,
+                'seller_id'  => $sellerId,
+                'amount'     => $amount,
+            ]);
             return true;
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('payout_failed', ['context' => 'reject_payout',
+                'payout_id' => $payoutId, 'error' => $e->getMessage()]);
             error_log('[seller_balance] reject_payout #' . $payoutId . ': ' . $e->getMessage());
             return false;
         }
@@ -1914,7 +2039,7 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
         string $paymentReference = '',
         string $paymentMethod = 'bank_transfer',
         string $note = ''
-    ): bool {
+    ): array|false {
         if ($payoutId <= 0) {
             return false;
         }
@@ -1930,7 +2055,9 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
             }
             if ((string)$req['status'] === 'paid') {
                 $pdo->commit();
-                return true;
+                bv_seller_balance_log('payout_paid_noop', ['payout_id' => $payoutId, 'reason' => 'already_paid']);
+                return ['ok' => true, 'noop' => true, 'payout_request_id' => $payoutId,
+                        'debit_ledger_id' => null, 'credit_ledger_id' => null, 'balance' => null];
             }
             if ((string)$req['status'] !== 'approved') {
                 $pdo->rollBack();
@@ -1948,11 +2075,17 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
                 throw new RuntimeException('Admin note is required for manual/other payout without payment reference.');
             }
 			
-            $sellerId = (int)$req['seller_id'];
-            $amount = round((float)$req['amount'], 4);
-            $currency = (string)$req['currency'];
-            $heldKey = 'payout_paid_held:' . $payoutId;
-            $paidKey = 'payout_paid_paid_out:' . $payoutId;
+            $sellerId   = (int)$req['seller_id'];
+            $amount     = round((float)$req['amount'], 4);
+            $currency   = (string)$req['currency'];
+
+            // Canonical idempotency keys (spec: payout_paid_held_debit / payout_paid_credit).
+            $heldKeyNew   = 'payout_paid_held_debit:' . $payoutId;
+            $paidKeyNew   = 'payout_paid_credit:'     . $payoutId;
+            // Legacy keys from prior revisions — checked so existing rows prevent re-insert.
+            $heldKeyOld   = 'payout_paid_held:'     . $payoutId;
+            $paidKeyOld   = 'payout_paid_paid_out:' . $payoutId;
+            $heldKeyOld2  = 'payout_paid_debit:'    . $payoutId; // written by v5 patch
 
             $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
             $balRow->execute([$sellerId]);
@@ -1962,112 +2095,191 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
                 return false;
             }
 
-            $heldNow = round((float)($balance['held_balance'] ?? 0), 4);
+            $heldNow    = round((float)($balance['held_balance']     ?? 0), 4);
             $paidOutNow = round((float)($balance['paid_out_balance'] ?? 0), 4);
-             if ($amount > $heldNow) {
+
+            if ($amount > $heldNow) {
                 $pdo->rollBack();
                 throw new RuntimeException('Held balance is lower than payout amount; cannot mark paid safely.');
             }
-			
-          $metaBase = _bv_sb_request_context_meta() + [
-                'action' => 'payout_paid',
-                'payout_request_id' => $payoutId,
-                'admin_id' => $adminId,
-                'old_status' => (string)$req['status'],
-                'new_status' => 'paid',
-                'payment_method' => $paymentMethod,
-                'payment_reference' => $paymentReference,
-            ];			
 
-            if (!_bv_sb_ledger_exists($pdo, $heldKey) && !_bv_sb_ledger_exists($pdo, $paidKey)) {
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id' => $sellerId,
-                    'type' => 'payout_paid',
-                    'balance_type' => 'held',
-                    'direction' => 'debit',
-                    'amount' => $amount,
-                    'currency' => $currency,
-                    'balance_before' => $heldNow,
-                    'balance_after' => round($heldNow - $amount, 4),
-                    'reference_type' => 'payout_request',
-                    'reference_id' => $payoutId,
-                    'idempotency_key' => $heldKey,
-                    'note' => 'Payout #' . $payoutId . ' paid - ref: ' . $paymentReference,
-                    'meta_json' => $metaBase,					
-                    'created_by_type' => 'admin',
-                    'created_by_id' => $adminId,
+            $metaBase = _bv_sb_request_context_meta() + [
+                'action'            => 'payout_paid',
+                'payout_request_id' => $payoutId,
+                'admin_id'          => $adminId,
+                'old_status'        => (string)$req['status'],
+                'new_status'        => 'paid',
+                'payment_method'    => $paymentMethod,
+                'payment_reference' => $paymentReference,
+            ];
+
+            bv_seller_balance_log('payout_paid_started', [
+                'payout_id' => $payoutId,
+                'admin_id'  => $adminId,
+                'amount'    => $amount,
+            ]);
+
+            // Idempotency: check both new and legacy key formats.
+            $heldExists = _bv_sb_ledger_exists($pdo, $heldKeyNew)
+                       || _bv_sb_ledger_exists($pdo, $heldKeyOld)
+                       || _bv_sb_ledger_exists($pdo, $heldKeyOld2);
+            $paidExists = _bv_sb_ledger_exists($pdo, $paidKeyNew)
+                       || _bv_sb_ledger_exists($pdo, $paidKeyOld);
+
+            if ($heldExists && $paidExists) {
+                // Both sides already written — ledger is idempotent.
+                bv_seller_balance_log('payout_paid_noop', [
+                    'payout_id' => $payoutId,
+                    'reason'    => 'ledger_already_exists',
                 ]);
-                _bv_sb_insert_ledger_once($pdo, [
-                    'seller_id' => $sellerId,
-                    'type' => 'payout_paid',
-                    'balance_type' => 'paid_out',
-                    'direction' => 'credit',
-                    'amount' => $amount, 
-                    'currency' => $currency,
-                    'balance_before' => $paidOutNow,
-                    'balance_after' => round($paidOutNow + $amount, 4),
-                    'reference_type' => 'payout_request',
-                    'reference_id' => $payoutId,
-                    'idempotency_key' => $paidKey,
-                    'note' => 'Payout #' . $payoutId . ' paid - ref: ' . $paymentReference,
-                    'meta_json' => $metaBase,					
+            } elseif ($heldExists xor $paidExists) {
+                $pdo->rollBack();
+                bv_seller_balance_log('payout_ledger_inconsistent', [
+                    'payout_id'   => $payoutId,
+                    'held_exists' => $heldExists,
+                    'paid_exists' => $paidExists,
+                    'context'     => 'mark_paid',
+                ]);
+                throw new RuntimeException(
+                    '[seller_balance] Payout ledger inconsistency on paid #' . $payoutId
+                    . ': exactly one of held/paid_out debit/credit entries exists. Manual review required.'
+                );
+            } else {
+                // Neither exists — write both atomically.
+                _bv_sb_guard_no_negative($heldNow, $amount, 'payout_paid held seller #' . $sellerId);
+
+                $debitLedgerId  = _bv_sb_insert_ledger_once($pdo, [
+                    'seller_id'       => $sellerId,
+                    'type'            => 'payout_paid',
+                    'balance_type'    => 'held',
+                    'direction'       => 'debit',
+                    'amount'          => $amount,
+                    'currency'        => $currency,
+                    'balance_before'  => $heldNow,
+                    'balance_after'   => round($heldNow - $amount, 4),
+                    'reference_type'  => 'payout_request',
+                    'reference_id'    => $payoutId,
+                    'idempotency_key' => $heldKeyNew,
+                    'note'            => 'Payout #' . $payoutId . ' paid — ref: ' . $paymentReference,
+                    'meta_json'       => $metaBase,
                     'created_by_type' => 'admin',
-                    'created_by_id' => $adminId,
+                    'created_by_id'   => $adminId,
+                ]);
+                $creditLedgerId = _bv_sb_insert_ledger_once($pdo, [
+                    'seller_id'       => $sellerId,
+                    'type'            => 'payout_paid',
+                    'balance_type'    => 'paid_out',
+                    'direction'       => 'credit',
+                    'amount'          => $amount,
+                    'currency'        => $currency,
+                    'balance_before'  => $paidOutNow,
+                    'balance_after'   => round($paidOutNow + $amount, 4),
+                    'reference_type'  => 'payout_request',
+                    'reference_id'    => $payoutId,
+                    'idempotency_key' => $paidKeyNew,
+                    'note'            => 'Payout #' . $payoutId . ' paid — ref: ' . $paymentReference,
+                    'meta_json'       => $metaBase,
+                    'created_by_type' => 'admin',
+                    'created_by_id'   => $adminId,
                 ]);
                 $pdo->prepare(
                     'UPDATE seller_balances
-                     SET held_balance = held_balance - :amt,
+                     SET held_balance     = held_balance     - :amt,
                          paid_out_balance = paid_out_balance + :amt
                      WHERE seller_id = :sid'
                 )->execute([':amt' => $amount, ':sid' => $sellerId]);
             }
 
-            $pdo->prepare(
-                'INSERT IGNORE INTO seller_payout_transactions
-                 (payout_request_id, seller_id, amount, currency, payment_method,
-                  payment_reference, bank_name, bank_account_number, bank_account_name,
-                  admin_id, note)
-                 VALUES
-                 (:prid, :sid, :amt, :cur, :method, :ref, :bank, :acct, :acct_name, :aid, :note)'
-            )->execute([
-                ':prid' => $payoutId,
-                ':sid' => $sellerId,
-                ':amt' => $amount,
-                ':cur' => $currency,
-                ':method' => $paymentMethod,
-                ':ref' => $paymentReference,
-                ':bank' => $req['bank_name'] ?? null,
-                ':acct' => $req['bank_account_number'] ?? null,
-                ':acct_name' => $req['bank_account_name'] ?? null,
-                ':aid' => $adminId,
-                ':note' => $note,
-            ]);
+            // Best-effort transaction record — table may not exist in all environments.
+            try {
+                $pdo->prepare(
+                    'INSERT IGNORE INTO seller_payout_transactions
+                     (payout_request_id, seller_id, amount, currency, payment_method,
+                      payment_reference, bank_name, bank_account_number, bank_account_name,
+                      admin_id, note)
+                     VALUES
+                     (:prid, :sid, :amt, :cur, :method, :ref, :bank, :acct, :acct_name, :aid, :note)'
+                )->execute([
+                    ':prid'      => $payoutId,
+                    ':sid'       => $sellerId,
+                    ':amt'       => $amount,
+                    ':cur'       => $currency,
+                    ':method'    => $paymentMethod,
+                    ':ref'       => $paymentReference,
+                    ':bank'      => $req['bank_name']           ?? null,
+                    ':acct'      => $req['bank_account_number'] ?? null,
+                    ':acct_name' => $req['bank_account_name']   ?? null,
+                    ':aid'       => $adminId,
+                    ':note'      => $note,
+                ]);
+            } catch (Throwable) {
+                // Non-fatal: seller_payout_transactions may not exist or schema may differ.
+            }
 
-             $set = ["status = 'paid'", 'payment_reference = :ref', "admin_note = CONCAT(COALESCE(admin_note,''), :note)"];
+            // Build UPDATE seller_payout_requests with matched SET clauses and params.
+            // IMPORTANT: every named placeholder added to $setParts must be added to
+            // $updParams at the same time — prevents SQLSTATE[HY093] "Invalid parameter
+            // number" caused by passing params whose placeholders are absent from the SQL.
+            $setParts  = ["status = 'paid'"];
+            $updParams = [
+                ':id'   => $payoutId,
+                ':note' => $note !== '' ? "\n[Paid] " . $note : '',
+            ];
+
+            // payment_reference — add only if column exists (avoids "Unknown column" too).
+            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'payment_reference')) {
+                $setParts[]        = 'payment_reference = :ref';
+                $updParams[':ref'] = $paymentReference;
+            }
+
+            // admin_note — column is standard; add note suffix.
+            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'admin_note')) {
+                $setParts[] = "admin_note = CONCAT(COALESCE(admin_note,''), :note)";
+                // ':note' already in $updParams above.
+            }
+
+            // paid_at — standard timestamp column.
             if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'paid_at')) {
-                $set[] = 'paid_at = COALESCE(paid_at, NOW())';
-            }
-            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'paid_by')) {
-                $set[] = 'paid_by = :admin_id';
-            } elseif (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'admin_id')) {
-                $set[] = 'admin_id = :admin_id';
+                $setParts[] = 'paid_at = COALESCE(paid_at, NOW())';
             }
 
-            $sql = 'UPDATE seller_payout_requests SET ' . implode(', ', $set) . ' WHERE id = :id';
-            $pdo->prepare($sql)->execute([
-                ':admin_id' => $adminId,
-                ':ref' => $paymentReference,
-                ':note' => $note !== '' ? "
-[Paid] " . $note : '',
-                ':id' => $payoutId,
-            ]);
+            // admin_id / paid_by — add :admin_id to params ONLY when column is in SQL.
+            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'paid_by')) {
+                $setParts[]              = 'paid_by = :admin_id';
+                $updParams[':admin_id']  = $adminId;
+            } elseif (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'admin_id')) {
+                $setParts[]              = 'admin_id = :admin_id';
+                $updParams[':admin_id']  = $adminId;
+            }
+            // If neither column exists, :admin_id is intentionally absent from both
+            // SQL and params — no HY093.
+
+            $pdo->prepare(
+                'UPDATE seller_payout_requests SET ' . implode(', ', $setParts) . ' WHERE id = :id'
+            )->execute($updParams);
+
+            bv_seller_balance_log('payout_paid_sql_ok', ['payout_id' => $payoutId]);
 
             $pdo->commit();
-            return true;
+            $snapStmt2 = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1');
+            $snapStmt2->execute([$sellerId]);
+            $newBalSnap = $snapStmt2->fetch(PDO::FETCH_ASSOC) ?: null;
+            bv_seller_balance_log('payout_paid_completed', [
+                'payout_id'        => $payoutId,
+                'admin_id'         => $adminId,
+                'seller_id'        => $sellerId,
+                'amount'           => $amount,
+                'payment_method'   => $paymentMethod,
+                'payment_reference'=> $paymentReference,
+            ]);
+            return ['ok' => true, 'noop' => false, 'payout_request_id' => $payoutId,
+                    'debit_ledger_id'  => $debitLedgerId  ?? null,
+                    'credit_ledger_id' => $creditLedgerId ?? null,
+                    'balance'          => $newBalSnap];
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('payout_failed', ['context' => 'mark_payout_paid',
+                'payout_id' => $payoutId, 'error' => $e->getMessage()]);
             error_log('[seller_balance] mark_payout_paid #' . $payoutId . ': ' . $e->getMessage());
             return false;
         }
@@ -2075,9 +2287,172 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
 }
 
 if (!function_exists('bv_seller_balance_cancel_payout')) {
+    /**
+     * Cancel a payout request and return held funds → available.
+     * Has its own ledger types (payout_cancel_*) separate from reject.
+     * Idempotency keys: payout_cancel_held_debit:{id} / payout_cancel_available_credit:{id}
+     */
     function bv_seller_balance_cancel_payout(int $payoutId, int $adminId, string $note = ''): bool
     {
-        return bv_seller_balance_reject_payout($payoutId, $adminId, $note ?: 'Cancelled by admin');
+        if ($payoutId <= 0) {
+            return false;
+        }
+        bv_seller_balance_log('payout_cancel_started', [
+            'payout_id' => $payoutId,
+            'admin_id'  => $adminId,
+        ]);
+        $pdo = bv_seller_balance_pdo();
+        try {
+            $pdo->beginTransaction();
+            $reqStmt = $pdo->prepare('SELECT * FROM seller_payout_requests WHERE id = ? LIMIT 1 FOR UPDATE');
+            $reqStmt->execute([$payoutId]);
+            $req = $reqStmt->fetch(PDO::FETCH_ASSOC);
+            if (!$req) {
+                $pdo->rollBack();
+                return false;
+            }
+            if ((string)$req['status'] === 'cancelled') {
+                $pdo->commit();
+                return true; // idempotent
+            }
+            if (!in_array((string)$req['status'], ['requested', 'approved'], true)) {
+                $pdo->rollBack();
+                return false;
+            }
+
+            $sellerId = (int)$req['seller_id'];
+            $amount   = round((float)$req['amount'], 4);
+            $currency = (string)$req['currency'];
+
+            $heldKeyNew      = 'payout_cancel_held_debit:'       . $payoutId;
+            $availableKeyNew = 'payout_cancel_available_credit:' . $payoutId;
+
+            $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
+            $balRow->execute([$sellerId]);
+            $balance = $balRow->fetch(PDO::FETCH_ASSOC);
+            if (!$balance) {
+                $pdo->rollBack();
+                return false;
+            }
+
+            $heldNow      = round((float)($balance['held_balance']      ?? 0), 4);
+            $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
+
+            if ($amount > $heldNow) {
+                $pdo->rollBack();
+                throw new RuntimeException('Held balance is lower than payout amount; cannot cancel safely.');
+            }
+
+            $metaBase = _bv_sb_request_context_meta() + [
+                'action'            => 'payout_cancel',
+                'payout_request_id' => $payoutId,
+                'admin_id'          => $adminId,
+                'old_status'        => (string)$req['status'],
+                'new_status'        => 'cancelled',
+                'payment_method'    => (string)($req['payout_method'] ?? ''),
+                'payment_reference' => null,
+            ];
+
+            if ($amount > 0) {
+                $heldExists      = _bv_sb_ledger_exists($pdo, $heldKeyNew);
+                $availableExists = _bv_sb_ledger_exists($pdo, $availableKeyNew);
+
+                if ($heldExists && $availableExists) {
+                    // Already reversed — noop on ledger.
+                } elseif ($heldExists xor $availableExists) {
+                    $pdo->rollBack();
+                    bv_seller_balance_log('payout_ledger_inconsistent', [
+                        'payout_id'       => $payoutId,
+                        'held_exists'     => $heldExists,
+                        'available_exists'=> $availableExists,
+                        'context'         => 'cancel',
+                    ]);
+                    bv_seller_balance_log('payout_inconsistent_ledger', [
+                        'payout_id' => $payoutId, 'context' => 'cancel']);
+                    throw new RuntimeException(
+                        '[seller_balance] Payout ledger inconsistency on cancel #' . $payoutId
+                        . ': exactly one reversal entry exists. Manual review required.'
+                    );
+                } else {
+                    _bv_sb_guard_no_negative($heldNow, $amount, 'payout_cancel held seller #' . $sellerId);
+
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'payout_cancel',
+                        'balance_type'    => 'held',
+                        'direction'       => 'debit',
+                        'amount'          => $amount,
+                        'currency'        => $currency,
+                        'balance_before'  => $heldNow,
+                        'balance_after'   => round($heldNow - $amount, 4),
+                        'reference_type'  => 'payout_request',
+                        'reference_id'    => $payoutId,
+                        'idempotency_key' => $heldKeyNew,
+                        'note'            => 'Payout #' . $payoutId . ' cancelled — returned to available',
+                        'meta_json'       => $metaBase,
+                        'created_by_type' => 'admin',
+                        'created_by_id'   => $adminId,
+                    ]);
+                    _bv_sb_insert_ledger_once($pdo, [
+                        'seller_id'       => $sellerId,
+                        'type'            => 'payout_cancel',
+                        'balance_type'    => 'available',
+                        'direction'       => 'credit',
+                        'amount'          => $amount,
+                        'currency'        => $currency,
+                        'balance_before'  => $availableNow,
+                        'balance_after'   => round($availableNow + $amount, 4),
+                        'reference_type'  => 'payout_request',
+                        'reference_id'    => $payoutId,
+                        'idempotency_key' => $availableKeyNew,
+                        'note'            => 'Payout #' . $payoutId . ' cancelled — returned to available',
+                        'meta_json'       => $metaBase,
+                        'created_by_type' => 'admin',
+                        'created_by_id'   => $adminId,
+                    ]);
+                    $pdo->prepare(
+                        'UPDATE seller_balances
+                         SET held_balance      = held_balance      - :amt,
+                             available_balance = available_balance + :amt
+                         WHERE seller_id = :sid'
+                    )->execute([':amt' => $amount, ':sid' => $sellerId]);
+                }
+            }
+
+            $set = ["status = 'cancelled'", "admin_note = CONCAT(COALESCE(admin_note,''), :note)"];
+            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'cancelled_at')) {
+                $set[] = 'cancelled_at = COALESCE(cancelled_at, NOW())';
+            }
+            if (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'cancelled_by')) {
+                $set[] = 'cancelled_by = :admin_id';
+            } elseif (_bv_sb_column_exists($pdo, 'seller_payout_requests', 'admin_id')) {
+                $set[] = 'admin_id = :admin_id';
+            }
+
+            $sql = 'UPDATE seller_payout_requests SET ' . implode(', ', $set) . ' WHERE id = :id';
+            $pdo->prepare($sql)->execute([
+                ':admin_id' => $adminId,
+                ':note'     => "
+[Cancelled] " . ($note ?: 'No reason given'),
+                ':id'       => $payoutId,
+            ]);
+
+            $pdo->commit();
+            bv_seller_balance_log('payout_cancel_completed', [
+                'payout_id' => $payoutId,
+                'admin_id'  => $adminId,
+                'seller_id' => $sellerId,
+                'amount'    => $amount,
+            ]);
+            return true;
+
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('payout_failed', ['context' => 'cancel_payout',
+                'payout_id' => $payoutId, 'error' => $e->getMessage()]);
+            error_log('[seller_balance] cancel_payout #' . $payoutId . ': ' . $e->getMessage());
+            return false;
+        }
     }
 }
 // ---------------------------------------------------------------------------
