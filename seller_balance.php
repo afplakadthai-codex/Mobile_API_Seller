@@ -332,6 +332,31 @@ if (!function_exists('_bv_sb_insert_ledger')) {
     }
 }
 
+
+if (!function_exists('_bv_sb_guard_no_negative')) {
+    /**
+     * Anti-negative balance guard.
+     * Throws RuntimeException if $currentBalance - $debitAmount < 0.
+     * Call this inside an active transaction BEFORE updating the balance.
+     *
+     * @throws RuntimeException
+     */
+    function _bv_sb_guard_no_negative(
+        float  $currentBalance,
+        float  $debitAmount,
+        string $context = ''
+    ): void {
+        if (round($currentBalance - $debitAmount, 4) < -0.00005) {
+            throw new RuntimeException(sprintf(
+                '[seller_balance] Anti-negative guard: cannot debit %.4f from balance %.4f%s.',
+                $debitAmount,
+                $currentBalance,
+                $context !== '' ? ' (' . $context . ')' : ''
+            ));
+        }
+    }
+}
+
 if (!function_exists('_bv_sb_table_exists')) {
     function _bv_sb_table_exists(PDO $pdo, string $table): bool
     {
@@ -894,18 +919,30 @@ if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
         ];
         foreach (bv_seller_balance_find_releasable_ledger_rows($sellerId) as $row) {
             if ($currency !== '' && strcasecmp((string)$row['currency'], $currency) !== 0) {
-				                $result['skipped_count']++;
+                $result['skipped_count']++;
                 continue;
             }
-            $amount = round((float)($row['net_amount'] ?? 0), 4);
-            if ($amount <= 0) {
+            $sourceAmount = round((float)($row['net_amount'] ?? 0), 4);
+            if ($sourceAmount <= 0) {
                 $result['skipped_count']++;
                 continue;
             }
             try {
-                if (bv_seller_balance_release_pending_for_row($row)) {
+                // release_pending_for_row() returns the ACTUAL released amount (float).
+                // 0.0 means nothing was released (already done, shortfall = 0, error).
+                $actualReleased = bv_seller_balance_release_pending_for_row($row);
+                if ($actualReleased > 0) {
                     $result['released_count']++;
-                    $result['released_amount'] = round(((float)$result['released_amount']) + $amount, 4);
+                    $result['released_amount'] = round((float)$result['released_amount'] + $actualReleased, 4);
+                    // Track shortfall if the actual amount is less than the source row amount.
+                    if ($actualReleased < $sourceAmount - 0.00005) {
+                        $result['shortfall_count'] = ($result['shortfall_count'] ?? 0) + 1;
+                        $result['shortfall_amount'] = round(
+                            (float)($result['shortfall_amount'] ?? 0.0)
+                            + round($sourceAmount - $actualReleased, 4),
+                            4
+                        );
+                    }
                 } else {
                     $result['skipped_count']++;
                 }
@@ -919,14 +956,21 @@ if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
 }
 
 if (!function_exists('bv_seller_balance_release_pending_for_row')) {
-    function bv_seller_balance_release_pending_for_row(array $row): bool
+    /**
+     * Release one pending row to available.
+     * Returns the actual amount released (float).
+     * Returns 0.0 when nothing was released (already done, shortfall = 0, error).
+     * Existing callers that test `if (bv_seller_balance_release_pending_for_row($row))` are unaffected
+     * because 0.0 is falsy and any positive float is truthy.
+     */
+    function bv_seller_balance_release_pending_for_row(array $row): float
     {
         $sellerId = (int)($row['seller_id'] ?? 0);
         $orderItemId = (int)($row['order_item_id'] ?? 0);
         $amount = round((float)($row['net_amount'] ?? 0), 4);
         $currency = (string)($row['currency'] ?? 'USD');
         if ($sellerId <= 0 || $orderItemId <= 0 || $amount <= 0) {
-            return false;
+            return 0.0; // invalid input
         }
 
         $pdo = bv_seller_balance_pdo();
@@ -937,7 +981,7 @@ if (!function_exists('bv_seller_balance_release_pending_for_row')) {
             $pdo->beginTransaction();
             if (_bv_sb_ledger_exists($pdo, $debitKey) || _bv_sb_ledger_exists($pdo, $creditKey)) {
                 $pdo->rollBack();
-                return false;
+                return 0.0; // already released (idempotency)
             }
 
             $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
@@ -945,16 +989,31 @@ if (!function_exists('bv_seller_balance_release_pending_for_row')) {
             $balance = $balRow->fetch(PDO::FETCH_ASSOC);
             if (!$balance) {
                 $pdo->rollBack();
-                return false;
+                return 0.0; // no balance row
             }
 
             $pendingNow = round((float)($balance['pending_balance'] ?? 0), 4);
             $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
-            $releaseAmt = min($amount, $pendingNow);
+
+            // Anti-negative guard: log shortfall; cap release at what is available in pending.
+            if ($amount > $pendingNow + 0.00005) {
+                bv_seller_balance_log('pending_release_shortfall', [
+                    'seller_id'      => $sellerId,
+                    'order_item_id'  => $orderItemId,
+                    'requested'      => $amount,
+                    'pending_now'    => $pendingNow,
+                    'shortfall'      => round($amount - $pendingNow, 4),
+                ]);
+            }
+
+            $releaseAmt = round(min($amount, $pendingNow), 4);
             if ($releaseAmt <= 0) {
                 $pdo->rollBack();
-                return false;
+                return 0.0; // nothing to release (pending is zero)
             }
+
+            // Hard guard: ensures pending will not go negative after release.
+            _bv_sb_guard_no_negative($pendingNow, $releaseAmt, 'pending_release seller #' . $sellerId);
 
             _bv_sb_insert_ledger_once($pdo, [
                 'seller_id' => $sellerId,
@@ -998,13 +1057,13 @@ if (!function_exists('bv_seller_balance_release_pending_for_row')) {
             )->execute([$releaseAmt, $releaseAmt, $sellerId]);
 
             $pdo->commit();
-            return true;
+            return $releaseAmt; // actual amount moved pending → available
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
             error_log('[seller_balance] release_pending row failed: ' . $e->getMessage());
-            return false;
+            return 0.0;
         }
     }
 }
@@ -1040,12 +1099,14 @@ if (!function_exists('bv_seller_balance_release_pending')) {
             }
             $pendingNow = round((float)$balance['pending_balance'], 4);
             $availableNow = round((float)$balance['available_balance'], 4);
-            $releaseAmt = min($amount, $pendingNow);
+            $releaseAmt = round(min($amount, $pendingNow), 4);
             if ($releaseAmt <= 0) {
                 $pdo->rollBack();
                 return false;
             }
             $currency = (string)($balance['currency'] ?? 'USD');
+            // Anti-negative guard.
+            _bv_sb_guard_no_negative($pendingNow, $releaseAmt, 'admin_pending_release seller #' . $sellerId);
             _bv_sb_insert_ledger_once($pdo, [
                 'seller_id' => $sellerId,
                 'type' => 'pending_release',
@@ -1386,7 +1447,7 @@ if (!function_exists('bv_seller_balance_reject_payout')) {
                 'payment_reference' => null,
             ];
 
-            if ($amount > 0 && !_bv_sb_ledger_exists($pdo, $heldKey)) {
+            if ($amount > 0 && !_bv_sb_ledger_exists($pdo, $heldKey) && !_bv_sb_ledger_exists($pdo, $availableKey)) {
                 _bv_sb_insert_ledger_once($pdo, [
                     'seller_id' => $sellerId,
                     'type' => 'payout_cancelled',
@@ -1531,7 +1592,7 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
                 'payment_reference' => $paymentReference,
             ];			
 
-            if (!_bv_sb_ledger_exists($pdo, $heldKey)) {
+            if (!_bv_sb_ledger_exists($pdo, $heldKey) && !_bv_sb_ledger_exists($pdo, $paidKey)) {
                 _bv_sb_insert_ledger_once($pdo, [
                     'seller_id' => $sellerId,
                     'type' => 'payout_paid',
@@ -1846,10 +1907,12 @@ if (!function_exists('bv_seller_balance_apply_refund_deduction')) {
                     continue;
                 }
                 $remaining = $needed;
+                // Deduction order: prefer pending first (cheapest to the seller),
+                // then available, finally held (which may already be ear-marked for payout).
                 foreach ([
-                    'held' => 'held_balance',
+                    'pending'   => 'pending_balance',
                     'available' => 'available_balance',
-                    'pending' => 'pending_balance',
+                    'held'      => 'held_balance',
                 ] as $balanceType => $column) {
                     if ($remaining <= 0) {
                         break;
@@ -1859,6 +1922,9 @@ if (!function_exists('bv_seller_balance_apply_refund_deduction')) {
                     if ($deduct <= 0) {
                         continue;
                     }
+                    // Anti-negative guard before each partial deduction.
+                    _bv_sb_guard_no_negative($before, $deduct, 'refund_deduction ' . $balanceType . ' seller #' . $sellerId);
+
                     _bv_sb_insert_ledger_once($pdo, [
                         'seller_id' => $sellerId,
                         'type' => 'refund_deduction',
@@ -2206,37 +2272,79 @@ if (!function_exists('bv_seller_balance_all_sellers_summary')) {
 }
 
 if (!function_exists('bv_seller_balance_reconcile_seller')) {
-    function bv_seller_balance_reconcile_seller(int $sellerId, string $currency = 'USD'): array
+    /**
+     * Reconcile seller_balances snapshot against seller_ledger source of truth.
+     *
+     * Runs inside a transaction with FOR UPDATE lock on seller_balances so no
+     * concurrent mutation can race the recomputation.
+     *
+     * @return array{
+     *   ok: bool,
+     *   ledger: array,
+     *   balance: array,
+     *   diff: array,
+     *   updated: bool,
+     *   drift_logged: bool,
+     * }
+     */
+    /**
+     * Reconcile seller_balances snapshot against seller_ledger.
+     *
+     * @param array $options  Supported keys:
+     *   'dry_run' => bool  When true: compute drift but DO NOT write to seller_balances.
+     *                       Returns 'dry_run'=>true, 'would_update'=>bool, 'current'=>[...], 'computed'=>[...].
+     *                       When false/omitted: existing behaviour (compute + update if drift found).
+     */
+    function bv_seller_balance_reconcile_seller(int $sellerId, string $currency = 'USD', array $options = []): array
     {
         $currency = strtoupper(trim($currency)) ?: 'USD';
         $result = [
-            'ok' => false,
-            'ledger' => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0],
-            'balance' => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0],
-            'diff' => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0],
+            'ok'          => false,
+            'dry_run'     => false,
+            'ledger'      => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0,
+                              'total_earned_gross' => 0.0, 'total_platform_fee' => 0.0],
+            'balance'     => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0,
+                              'total_earned_gross' => 0.0, 'total_platform_fee' => 0.0],
+            'diff'        => ['pending' => 0.0, 'available' => 0.0, 'held' => 0.0, 'paid_out' => 0.0,
+                              'total_earned_gross' => 0.0, 'total_platform_fee' => 0.0],
+            'updated'     => false,
+            'drift_logged'=> false,
         ];
         if ($sellerId <= 0) {
             return $result;
         }
 
+        $isDryRun = !empty($options['dry_run']);
+
+        $pdo = bv_seller_balance_pdo();
+
         try {
-            $pdo = bv_seller_balance_pdo();
+            $pdo->beginTransaction();
+
+            // ── Lock snapshot row ───────────────────────────────────────────────
             $balStmt = $pdo->prepare(
-                'SELECT pending_balance, available_balance, held_balance, paid_out_balance
-                 FROM seller_balances
+                'SELECT * FROM seller_balances
                  WHERE seller_id = ? AND currency = ?
-                 LIMIT 1'
+                 LIMIT 1 FOR UPDATE'
             );
             $balStmt->execute([$sellerId, $currency]);
-            $balance = $balStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+            $balance = $balStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$balance) {
+                $pdo->rollBack();
+                return $result;
+            }
 
             $result['balance'] = [
-                'pending' => round((float)($balance['pending_balance'] ?? 0), 4),
-                'available' => round((float)($balance['available_balance'] ?? 0), 4),
-                'held' => round((float)($balance['held_balance'] ?? 0), 4),
-                'paid_out' => round((float)($balance['paid_out_balance'] ?? 0), 4),
+                'pending'            => round((float)($balance['pending_balance']    ?? 0), 4),
+                'available'          => round((float)($balance['available_balance']  ?? 0), 4),
+                'held'               => round((float)($balance['held_balance']       ?? 0), 4),
+                'paid_out'           => round((float)($balance['paid_out_balance']   ?? 0), 4),
+                'total_earned_gross' => round((float)($balance['total_earned_gross'] ?? 0), 4),
+                'total_platform_fee' => round((float)($balance['total_platform_fee'] ?? 0), 4),
             ];
 
+            // ── Recompute balance_type sums from ledger ─────────────────────────
             $ledgerStmt = $pdo->prepare(
                 "SELECT balance_type,
                         SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END) AS net_amount
@@ -2246,30 +2354,118 @@ if (!function_exists('bv_seller_balance_reconcile_seller')) {
             );
             $ledgerStmt->execute([$sellerId, $currency]);
             foreach ($ledgerStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                $bt = (string)($row['balance_type'] ?? '');
+                $bt  = (string)($row['balance_type'] ?? '');
                 $net = round((float)($row['net_amount'] ?? 0), 4);
-                if ($bt === 'pending') {
-                    $result['ledger']['pending'] = $net;
-                } elseif ($bt === 'available') {
-                    $result['ledger']['available'] = $net;
-                } elseif ($bt === 'held') {
-                    $result['ledger']['held'] = $net;
-                } elseif ($bt === 'paid_out') {
-                    $result['ledger']['paid_out'] = $net;
+                match ($bt) {
+                    'pending'   => $result['ledger']['pending']   = $net,
+                    'available' => $result['ledger']['available'] = $net,
+                    'held'      => $result['ledger']['held']      = $net,
+                    'paid_out'  => $result['ledger']['paid_out']  = $net,
+                    default     => null,
+                };
+            }
+
+            // ── Recompute total_earned_gross (sum of earning credits) ───────────
+            $grossStmt = $pdo->prepare(
+                "SELECT COALESCE(SUM(amount), 0)
+                 FROM seller_ledger
+                 WHERE seller_id = ? AND currency = ?
+                   AND type = 'earning' AND direction = 'credit'"
+            );
+            $grossStmt->execute([$sellerId, $currency]);
+            $result['ledger']['total_earned_gross'] = round((float)$grossStmt->fetchColumn(), 4);
+
+            // ── Recompute total_platform_fee (sum of platform_fee debits) ───────
+            $feeStmt = $pdo->prepare(
+                "SELECT COALESCE(SUM(amount), 0)
+                 FROM seller_ledger
+                 WHERE seller_id = ? AND currency = ?
+                   AND type = 'platform_fee' AND direction = 'debit'"
+            );
+            $feeStmt->execute([$sellerId, $currency]);
+            $result['ledger']['total_platform_fee'] = round((float)$feeStmt->fetchColumn(), 4);
+
+            // ── Compute diffs ───────────────────────────────────────────────────
+            $driftFields = ['pending', 'available', 'held', 'paid_out',
+                            'total_earned_gross', 'total_platform_fee'];
+            $driftFound  = false;
+            foreach ($driftFields as $k) {
+                $result['diff'][$k] = round($result['balance'][$k] - $result['ledger'][$k], 4);
+                if (abs($result['diff'][$k]) >= 0.0001) {
+                    $driftFound = true;
                 }
             }
 
-            foreach ($result['ledger'] as $key => $ledgerAmt) {
-                $result['diff'][$key] = round($result['balance'][$key] - $ledgerAmt, 4);
+            $result['ok'] = !$driftFound;
+
+            // ── Dry-run: report only, no DB write ──────────────────────────────
+            if ($isDryRun) {
+                $pdo->rollBack(); // release the FOR UPDATE lock immediately
+
+                $result['dry_run']      = true;
+                $result['would_update'] = $driftFound;
+                $result['current']      = $result['balance'];
+                $result['computed']     = $result['ledger'];
+
+                if (function_exists('bv_seller_balance_log')) {
+                    bv_seller_balance_log('reconcile_preview', [
+                        'seller_id'    => $sellerId,
+                        'currency'     => $currency,
+                        'drift_found'  => $driftFound,
+                        'current'      => $result['balance'],
+                        'computed'     => $result['ledger'],
+                        'diff'         => $result['diff'],
+                    ]);
+                }
+
+                return $result;
             }
-            $result['ok'] = (
-                abs($result['diff']['pending']) < 0.0001
-                && abs($result['diff']['available']) < 0.0001
-                && abs($result['diff']['held']) < 0.0001
-                && abs($result['diff']['paid_out']) < 0.0001
-            );
-        } catch (Throwable) {
-            // keep default false
+
+            // ── Live run: correct snapshot + log if drift found ─────────────────
+            if ($driftFound) {
+                $pdo->prepare(
+                    'UPDATE seller_balances
+                     SET pending_balance    = :pending,
+                         available_balance  = :available,
+                         held_balance       = :held,
+                         paid_out_balance   = :paid_out,
+                         total_earned_gross = :gross,
+                         total_platform_fee = :fee,
+                         updated_at         = NOW()
+                     WHERE seller_id = :sid AND currency = :cur'
+                )->execute([
+                    ':pending'   => $result['ledger']['pending'],
+                    ':available' => $result['ledger']['available'],
+                    ':held'      => $result['ledger']['held'],
+                    ':paid_out'  => $result['ledger']['paid_out'],
+                    ':gross'     => $result['ledger']['total_earned_gross'],
+                    ':fee'       => $result['ledger']['total_platform_fee'],
+                    ':sid'       => $sellerId,
+                    ':cur'       => $currency,
+                ]);
+                $result['updated'] = true;
+
+                bv_seller_balance_log('balance_drift_corrected', [
+                    'seller_id'  => $sellerId,
+                    'currency'   => $currency,
+                    'old'        => $result['balance'],
+                    'new'        => $result['ledger'],
+                    'diff'       => $result['diff'],
+                ]);
+                $result['drift_logged'] = true;
+            }
+
+            $result['dry_run'] = false;
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            bv_seller_balance_log('reconcile_error', [
+                'seller_id' => $sellerId,
+                'currency'  => $currency,
+                'error'     => $e->getMessage(),
+            ]);
         }
 
         return $result;
