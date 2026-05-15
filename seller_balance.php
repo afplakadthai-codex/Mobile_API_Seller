@@ -788,18 +788,27 @@ if (!function_exists('bv_seller_balance_process_order_paid')) {
 // PENDING → AVAILABLE RELEASE
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Internal: find pending sale ledger rows eligible for release.
+// Supports both legacy 'earning' and newer 'sale_pending' ledger types.
+// Purely ledger-based — no fulfillment or order-status gating (per design).
+// Checks both new-format and legacy idempotency keys so already-released rows
+// are excluded regardless of which release path wrote them.
+// ---------------------------------------------------------------------------
 if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
     function bv_seller_balance_find_releasable_ledger_rows(?int $sellerId = null): array
     {
-        $pdo = bv_seller_balance_pdo();
+        $pdo  = bv_seller_balance_pdo();
         $days = max(0, (int)bv_seller_balance_get_setting('payout_clearance_days', '3'));
-        $params = [$days];
+
+        $params    = [$days];
         $sellerSql = '';
         if ($sellerId !== null && $sellerId > 0) {
-          $sellerSql = ' AND e.seller_id = ?';
-            $params[] = $sellerId; 
+            $sellerSql  = ' AND e.seller_id = ?';
+            $params[]   = $sellerId;
         }
 
+        // Refund block: if the tables exist, exclude items with active refunds.
         $activeRefundSql = '';
         if (_bv_sb_table_exists($pdo, 'order_refunds') && _bv_sb_table_exists($pdo, 'order_refund_items')) {
             $activeRefundSql = "
@@ -807,118 +816,535 @@ if (!function_exists('bv_seller_balance_find_releasable_ledger_rows')) {
                    SELECT 1
                    FROM order_refund_items ri
                    JOIN order_refunds r ON r.id = ri.refund_id
-                   WHERE ri.order_item_id = oi.id
-                     AND r.status IN ('draft','pending_approval','partially_approved','approved','processing','partially_refunded')
+                   WHERE ri.order_item_id = e.reference_id
+                     AND r.status IN ('draft','pending_approval','partially_approved',
+                                      'approved','processing','partially_refunded')
                )";
         }
 
-        $paymentStatusSql = '';
-        if (_bv_sb_column_exists($pdo, 'orders', 'payment_status')) {
-            $paymentStatusSql = " AND o.payment_status IN ('paid','succeeded','complete','completed')";
-        }
-
-        // SAFETY: only release when fulfillment is explicitly confirmed.
-        // Empty/NULL fulfillment_status means not shipped → do NOT release.
-        $fulfillmentSql = '';
-        if (_bv_sb_column_exists($pdo, 'order_items', 'fulfillment_status')) {
-            $fulfillmentSql = " AND oi.fulfillment_status IN ('shipped','completed','delivered')";
-        }
-
+        // NOT EXISTS: covers both new key format and legacy key format so rows
+        // released by either path are correctly excluded.
         $sql = "SELECT e.seller_id,
-                       e.reference_id AS order_item_id,
+                       e.reference_id                                            AS order_item_id,
                        e.currency,
                        e.created_at,
-                       oi.order_id,
-                       o.order_code,
-                       COALESCE(e.amount, 0) AS gross_amount,
-                       COALESCE(f.pending_fee_amount, 0) AS fee_amount,
-                       COALESCE(e.amount, 0) - COALESCE(f.pending_fee_amount, 0) AS net_amount 
+                       COALESCE(oi.order_id, 0)                                 AS order_id,
+                       COALESCE(o.order_code, '')                               AS order_code,
+                       COALESCE(e.amount, 0)                                    AS gross_amount,
+                       COALESCE(f.pending_fee_amount, 0)                        AS fee_amount,
+                       COALESCE(e.amount, 0) - COALESCE(f.pending_fee_amount, 0) AS net_amount
                 FROM seller_ledger e
-                JOIN order_items oi ON oi.id = e.reference_id AND oi.seller_id = e.seller_id
-                JOIN orders o ON o.id = oi.order_id
+                LEFT JOIN order_items oi ON oi.id = e.reference_id
+                LEFT JOIN orders      o  ON o.id  = oi.order_id
                 LEFT JOIN (
                     SELECT seller_id,
                            reference_id,
                            SUM(amount) AS pending_fee_amount
                     FROM seller_ledger
-                    WHERE type = 'platform_fee'
-                      AND balance_type = 'pending'
-                      AND direction = 'debit'
+                    WHERE type          = 'platform_fee'
+                      AND balance_type  = 'pending'
+                      AND direction     = 'debit'
                       AND reference_type = 'order_item'
                     GROUP BY seller_id, reference_id
-                ) f
-                   ON f.seller_id = e.seller_id
-                  AND f.reference_id = e.reference_id
-                WHERE e.type = 'earning'
-                  AND e.balance_type = 'pending'
-                  AND e.direction = 'credit'
+                ) f ON f.seller_id = e.seller_id AND f.reference_id = e.reference_id
+                WHERE e.type          IN ('earning', 'sale_pending')
+                  AND e.balance_type   = 'pending'
+                  AND e.direction      = 'credit'
                   AND e.reference_type = 'order_item'
-                   AND e.amount > 0
-                  AND e.created_at <= DATE_SUB(NOW(), INTERVAL ? DAY)
-                  AND o.status IN ('confirmed','paid','processing','shipped','completed')
-                  $paymentStatusSql
-                  $fulfillmentSql
+                  AND e.amount         > 0
+                  AND e.created_at    <= DATE_SUB(NOW(), INTERVAL ? DAY)
+                  -- Exclude rows already released via NEW key format
                   AND NOT EXISTS (
-                      SELECT 1 FROM seller_ledger prd
-                      WHERE prd.idempotency_key = CONCAT('pending_release_debit:', e.seller_id, ':', e.reference_id)
+                      SELECT 1 FROM seller_ledger k1
+                      WHERE k1.idempotency_key IN (
+                          CONCAT('release_pending_debit:', e.reference_id),
+                          CONCAT('release_available_credit:', e.reference_id)
+                      )
                   )
+                  -- Exclude rows already released via LEGACY key format
                   AND NOT EXISTS (
-                      SELECT 1 FROM seller_ledger prc
-                      WHERE prc.idempotency_key = CONCAT('pending_release_credit:', e.seller_id, ':', e.reference_id)
+                      SELECT 1 FROM seller_ledger k2
+                      WHERE k2.idempotency_key IN (
+                          CONCAT('pending_release_debit:', e.seller_id, ':', e.reference_id),
+                          CONCAT('pending_release_credit:', e.seller_id, ':', e.reference_id)
+                      )
                   )
+                  -- Exclude rows with an active refund hold
                   AND NOT EXISTS (
                       SELECT 1 FROM seller_ledger rh
-                      WHERE rh.seller_id = e.seller_id
-                        AND rh.type = 'refund_hold'
+                      WHERE rh.seller_id      = e.seller_id
+                        AND rh.type           = 'refund_hold'
                         AND rh.reference_type = 'order_item'
-                        AND rh.reference_id = e.reference_id
+                        AND rh.reference_id   = e.reference_id
                   )
-                  $sellerSql
-                  $activeRefundSql
+                  {$sellerSql}
+                  {$activeRefundSql}
                 HAVING net_amount > 0
                 ORDER BY e.created_at ASC, e.id ASC";
+
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
         return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
     }
 }
 
-if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
-    function bv_seller_balance_release_pending_by_order_item(int $orderItemId): bool
+// ---------------------------------------------------------------------------
+// Internal: canonical single-row pending → available release worker.
+// Uses new idempotency key format while also recognising legacy format.
+// Returns rich detail array consumed by public wrappers.
+// ---------------------------------------------------------------------------
+if (!function_exists('_bv_sb_release_one_row')) {
+    /**
+     * Core pending → available release worker.
+     * Idempotency: checks both old and new key formats before inserting.
+     * New ledger rows are written with the OLD (seller-scoped) key format for
+     * backward compatibility with existing production ledger rows.
+     * Returns a full detail array; the 'message' field summarises the outcome.
+     */
+    function _bv_sb_release_one_row(PDO $pdo, array $row): array
     {
+        $sellerId     = (int)($row['seller_id']     ?? 0);
+        $orderItemId  = (int)($row['order_item_id'] ?? $row['reference_id'] ?? 0);
+        $sourceAmount = round((float)($row['net_amount'] ?? $row['amount'] ?? 0), 4);
+        $currency     = (string)($row['currency']   ?? 'USD');
+        $orderId      = (int)($row['order_id']      ?? 0);
+        $orderCode    = (string)($row['order_code'] ?? '');
+
+        $base = [
+            'ok'                     => false,
+            'noop'                   => false,
+            'seller_id'              => $sellerId,
+            'order_item_id'          => $orderItemId,
+            'source_amount'          => $sourceAmount,
+            'actual_released_amount' => 0.0,
+            'shortfall'              => 0.0,
+            'debit_ledger_id'        => null,
+            'credit_ledger_id'       => null,
+            'balance'                => null,
+            'message'                => '',
+        ];
+
+        if ($sellerId <= 0 || $orderItemId <= 0 || $sourceAmount <= 0) {
+            $base['message'] = 'Invalid input: seller_id, order_item_id, or source_amount is missing.';
+            $base['noop']    = true;
+            return $base;
+        }
+
+        // Idempotency key pairs.
+        // OLD format (seller-scoped) — used for new inserts and for checking legacy rows.
+        $debitKeyOld  = 'pending_release_debit:'  . $sellerId . ':' . $orderItemId;
+        $creditKeyOld = 'pending_release_credit:' . $sellerId . ':' . $orderItemId;
+        // NEW format (item-scoped only) — checked for rows written by earlier patch version.
+        $debitKeyNew  = 'release_pending_debit:'    . $orderItemId;
+        $creditKeyNew = 'release_available_credit:' . $orderItemId;
+
+        bv_seller_balance_log('pending_release_started', [
+            'seller_id'     => $sellerId,
+            'order_item_id' => $orderItemId,
+            'source_amount' => $sourceAmount,
+        ]);
+
+        $ownTransaction = false;
+        try {
+            if (!$pdo->inTransaction()) {
+                $pdo->beginTransaction();
+                $ownTransaction = true;
+            }
+
+            // ── Idempotency: check both old and new formats ──────────────────
+            $debitExists  = _bv_sb_ledger_exists($pdo, $debitKeyOld)
+                         || _bv_sb_ledger_exists($pdo, $debitKeyNew);
+            $creditExists = _bv_sb_ledger_exists($pdo, $creditKeyOld)
+                         || _bv_sb_ledger_exists($pdo, $creditKeyNew);
+
+            if ($debitExists && $creditExists) {
+                if ($ownTransaction) { $pdo->rollBack(); }
+                bv_seller_balance_log('pending_release_noop', [
+                    'seller_id'     => $sellerId,
+                    'order_item_id' => $orderItemId,
+                    'reason'        => 'already_released',
+                ]);
+                return array_merge($base, [
+                    'ok'      => true,
+                    'noop'    => true,
+                    'message' => 'Already released (idempotency).',
+                ]);
+            }
+
+            if ($debitExists xor $creditExists) {
+                // One side present, other missing — ledger inconsistency.
+                if ($ownTransaction) { $pdo->rollBack(); }
+                $msg = '[seller_balance] Ledger inconsistency for order_item #' . $orderItemId
+                     . ': exactly one of debit/credit release entries exists. Manual review required.';
+                bv_seller_balance_log('pending_release_inconsistent_idempotency', [
+                    'seller_id'     => $sellerId,
+                    'order_item_id' => $orderItemId,
+                    'debit_exists'  => $debitExists,
+                    'credit_exists' => $creditExists,
+                ]);
+                return array_merge($base, ['ok' => false, 'message' => $msg]);
+            }
+
+            // ── Lock seller_balances row (SELECT ... FOR UPDATE) ─────────────
+            $balStmt = $pdo->prepare(
+                'SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE'
+            );
+            $balStmt->execute([$sellerId]);
+            $balance = $balStmt->fetch(PDO::FETCH_ASSOC);
+            if (!$balance) {
+                if ($ownTransaction) { $pdo->rollBack(); }
+                $msg = 'No seller_balances row found for seller #' . $sellerId . '.';
+                bv_seller_balance_log('pending_release_failed', [
+                    'seller_id'     => $sellerId,
+                    'order_item_id' => $orderItemId,
+                    'reason'        => 'no_balance_row',
+                ]);
+                return array_merge($base, ['message' => $msg]);
+            }
+
+            $pendingNow   = round((float)($balance['pending_balance']   ?? 0), 4);
+            $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
+
+            // ── Anti-negative: pending_balance is zero → noop ────────────────
+            if ($pendingNow <= 0) {
+                if ($ownTransaction) { $pdo->rollBack(); }
+                bv_seller_balance_log('pending_release_noop', [
+                    'seller_id'     => $sellerId,
+                    'order_item_id' => $orderItemId,
+                    'reason'        => 'pending_balance_zero',
+                    'pending_now'   => $pendingNow,
+                ]);
+                return array_merge($base, [
+                    'ok'      => true,
+                    'noop'    => true,
+                    'message' => 'Pending balance is zero; nothing to release.',
+                ]);
+            }
+
+            // ── Shortfall: cap release at available pending ───────────────────
+            $shortfall  = 0.0;
+            $releaseAmt = $sourceAmount;
+            if ($sourceAmount > $pendingNow + 0.00005) {
+                $shortfall  = round($sourceAmount - $pendingNow, 4);
+                $releaseAmt = $pendingNow;
+                bv_seller_balance_log('pending_release_shortfall', [
+                    'seller_id'     => $sellerId,
+                    'order_item_id' => $orderItemId,
+                    'source_amount' => $sourceAmount,
+                    'pending_now'   => $pendingNow,
+                    'shortfall'     => $shortfall,
+                ]);
+            }
+            $releaseAmt = round($releaseAmt, 4);
+
+            // Hard anti-negative guard (throws on programmer error).
+            _bv_sb_guard_no_negative(
+                $pendingNow, $releaseAmt,
+                'release_one_row seller #' . $sellerId . ' item #' . $orderItemId
+            );
+
+            $meta = [
+                'order_id'      => $orderId,
+                'order_code'    => $orderCode,
+                'source_amount' => $sourceAmount,
+                'shortfall'     => $shortfall,
+            ];
+
+            // ── Insert debit ledger row — OLD key format ─────────────────────
+            $debitLedgerId = _bv_sb_insert_ledger($pdo, [
+                'seller_id'       => $sellerId,
+                'type'            => 'pending_release',
+                'balance_type'    => 'pending',
+                'direction'       => 'debit',
+                'amount'          => $releaseAmt,
+                'currency'        => $currency,
+                'balance_before'  => $pendingNow,
+                'balance_after'   => round($pendingNow - $releaseAmt, 4),
+                'reference_type'  => 'order_item',
+                'reference_id'    => $orderItemId,
+                'idempotency_key' => $debitKeyOld,
+                'note'            => 'Pending released for order item #' . $orderItemId,
+                'meta_json'       => $meta,
+                'created_by_type' => 'system',
+            ]);
+
+            // ── Insert credit ledger row — OLD key format ────────────────────
+            $creditLedgerId = _bv_sb_insert_ledger($pdo, [
+                'seller_id'       => $sellerId,
+                'type'            => 'pending_release',
+                'balance_type'    => 'available',
+                'direction'       => 'credit',
+                'amount'          => $releaseAmt,
+                'currency'        => $currency,
+                'balance_before'  => $availableNow,
+                'balance_after'   => round($availableNow + $releaseAmt, 4),
+                'reference_type'  => 'order_item',
+                'reference_id'    => $orderItemId,
+                'idempotency_key' => $creditKeyOld,
+                'note'            => 'Pending released for order item #' . $orderItemId,
+                'meta_json'       => $meta,
+                'created_by_type' => 'system',
+            ]);
+
+            // ── Update seller_balances snapshot ──────────────────────────────
+            $pdo->prepare(
+                'UPDATE seller_balances
+                 SET pending_balance   = pending_balance   - ?,
+                     available_balance = available_balance + ?
+                 WHERE seller_id = ?'
+            )->execute([$releaseAmt, $releaseAmt, $sellerId]);
+
+            if ($ownTransaction) { $pdo->commit(); }
+
+            // Re-read updated snapshot.
+            $snapStmt = $pdo->prepare(
+                'SELECT pending_balance, available_balance FROM seller_balances WHERE seller_id = ? LIMIT 1'
+            );
+            $snapStmt->execute([$sellerId]);
+            $newSnap = $snapStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+
+            bv_seller_balance_log('pending_release_completed', [
+                'seller_id'       => $sellerId,
+                'order_item_id'   => $orderItemId,
+                'released_amount' => $releaseAmt,
+                'shortfall'       => $shortfall,
+            ]);
+
+            $msg = $shortfall > 0
+                ? 'Released ' . $releaseAmt . ' (shortfall ' . $shortfall . ').'
+                : 'Released ' . $releaseAmt . '.';
+
+            return [
+                'ok'                     => true,
+                'noop'                   => false,
+                'seller_id'              => $sellerId,
+                'order_item_id'          => $orderItemId,
+                'source_amount'          => $sourceAmount,
+                'actual_released_amount' => $releaseAmt,
+                'shortfall'              => $shortfall,
+                'debit_ledger_id'        => $debitLedgerId,
+                'credit_ledger_id'       => $creditLedgerId,
+                'balance'                => $newSnap,
+                'message'                => $msg,
+            ];
+
+        } catch (Throwable $e) {
+            if ($ownTransaction && $pdo->inTransaction()) { $pdo->rollBack(); }
+            bv_seller_balance_log('pending_release_failed', [
+                'seller_id'     => $sellerId,
+                'order_item_id' => $orderItemId,
+                'error'         => $e->getMessage(),
+            ]);
+            throw $e;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public: release pending balance for one specific order_item_id.
+//
+// Signature accepts seller_id + order_item_id + currency so callers can
+// target the exact ledger row. seller_id = 0 means "any seller" (legacy
+// single-arg behaviour is preserved when only $orderItemId is given).
+//
+// Returns bool for backward compatibility:
+//   true  — released successfully (actual_released_amount > 0)
+//   false — not found, noop, inconsistency, or failure
+// ---------------------------------------------------------------------------
+if (!function_exists('bv_seller_balance_release_pending_by_order_item')) {
+    function bv_seller_balance_release_pending_by_order_item(
+        int    $sellerId    = 0,
+        int    $orderItemId = 0,
+        string $currency    = ''
+    ): bool {
+        // Support legacy single-argument callers:
+        //   bv_seller_balance_release_pending_by_order_item($orderItemId)
+        // In that form $sellerId holds the item ID and $orderItemId is 0.
+        if ($sellerId > 0 && $orderItemId === 0) {
+            $orderItemId = $sellerId;
+            $sellerId    = 0;
+        }
+
         if ($orderItemId <= 0) {
+            bv_seller_balance_log('pending_release_by_order_item_failed', [
+                'seller_id'      => $sellerId,
+                'order_item_id'  => $orderItemId,
+                'currency'       => $currency,
+                'reason'         => 'invalid_order_item_id',
+            ]);
             return false;
         }
-        $rows = bv_seller_balance_find_releasable_ledger_rows(null);
-        foreach ($rows as $row) {
-            if ((int)$row['order_item_id'] === $orderItemId) {
-                return bv_seller_balance_release_pending_for_row($row);
-            }
+
+        bv_seller_balance_log('pending_release_by_order_item_started', [
+            'seller_id'     => $sellerId,
+            'order_item_id' => $orderItemId,
+            'currency'      => $currency,
+        ]);
+
+        $pdo = bv_seller_balance_pdo();
+
+        // Build optional WHERE clauses for seller and currency.
+        $sellerClause   = $sellerId > 0 ? ' AND sl.seller_id = ?' : '';
+        $currencyClause = ($currency !== '') ? ' AND sl.currency = ?' : '';
+
+        // Fee sub-query also scoped to seller when provided.
+        $feeSellerClause = $sellerId > 0 ? ' AND seller_id = ?' : '';
+
+        $sql = "SELECT sl.seller_id,
+                       sl.reference_id                                          AS order_item_id,
+                       sl.currency,
+                       COALESCE(oi.order_id, 0)                                AS order_id,
+                       COALESCE(o.order_code, '')                              AS order_code,
+                       COALESCE(sl.amount, 0)                                  AS gross_amount,
+                       COALESCE(fee.fee_amount, 0)                             AS fee_amount,
+                       COALESCE(sl.amount, 0) - COALESCE(fee.fee_amount, 0)   AS net_amount
+                FROM seller_ledger sl
+                LEFT JOIN order_items oi ON oi.id = sl.reference_id
+                LEFT JOIN orders      o  ON o.id  = oi.order_id
+                LEFT JOIN (
+                    SELECT seller_id, reference_id, SUM(amount) AS fee_amount
+                    FROM seller_ledger
+                    WHERE type           = 'platform_fee'
+                      AND balance_type   = 'pending'
+                      AND direction      = 'debit'
+                      AND reference_type = 'order_item'
+                      AND reference_id   = ?
+                      {$feeSellerClause}
+                    GROUP BY seller_id, reference_id
+                ) fee ON fee.seller_id = sl.seller_id AND fee.reference_id = sl.reference_id
+                WHERE sl.type           IN ('earning', 'sale_pending')
+                  AND sl.balance_type   = 'pending'
+                  AND sl.direction      = 'credit'
+                  AND sl.reference_type = 'order_item'
+                  AND sl.reference_id   = ?
+                  {$sellerClause}
+                  {$currencyClause}
+                LIMIT 1";
+
+        // Bind params: fee sub-query reference_id first, then main WHERE.
+        $params = [$orderItemId];                      // fee sub-query reference_id
+        if ($sellerId > 0) { $params[] = $sellerId; } // fee sub-query seller_id
+        $params[] = $orderItemId;                      // main WHERE reference_id
+        if ($sellerId > 0) { $params[] = $sellerId; } // main WHERE seller_id
+        if ($currency !== '') { $params[] = $currency; } // main WHERE currency
+
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        } catch (Throwable $e) {
+            bv_seller_balance_log('pending_release_by_order_item_failed', [
+                'seller_id'     => $sellerId,
+                'order_item_id' => $orderItemId,
+                'currency'      => $currency,
+                'reason'        => 'query_error',
+                'error'         => $e->getMessage(),
+            ]);
+            error_log('[seller_balance] release_pending_by_order_item query failed: ' . $e->getMessage());
+            return false;
         }
+
+        if (!$row) {
+            bv_seller_balance_log('pending_release_by_order_item_failed', [
+                'seller_id'     => $sellerId,
+                'order_item_id' => $orderItemId,
+                'currency'      => $currency,
+                'reason'        => 'ledger_row_not_found',
+                'debug'         => 'No pending earning/sale_pending credit row found in seller_ledger.',
+            ]);
+            return false;
+        }
+
+        $netAmount = round((float)($row['net_amount'] ?? 0), 4);
+        if ($netAmount <= 0) {
+            bv_seller_balance_log('pending_release_by_order_item_noop', [
+                'seller_id'     => (int)($row['seller_id'] ?? $sellerId),
+                'order_item_id' => $orderItemId,
+                'currency'      => (string)($row['currency'] ?? $currency),
+                'reason'        => 'net_amount_zero_or_negative',
+                'gross_amount'  => (float)($row['gross_amount'] ?? 0),
+                'fee_amount'    => (float)($row['fee_amount'] ?? 0),
+                'net_amount'    => $netAmount,
+            ]);
+            return false;
+        }
+
+        // Delegate to the public row-level function (returns detail array).
+        try {
+            $result = bv_seller_balance_release_pending_for_row($row);
+        } catch (Throwable $e) {
+            bv_seller_balance_log('pending_release_by_order_item_failed', [
+                'seller_id'     => (int)($row['seller_id'] ?? $sellerId),
+                'order_item_id' => $orderItemId,
+                'currency'      => (string)($row['currency'] ?? $currency),
+                'reason'        => 'release_exception',
+                'error'         => $e->getMessage(),
+            ]);
+            error_log('[seller_balance] release_pending_by_order_item #' . $orderItemId . ': ' . $e->getMessage());
+            return false;
+        }
+
+        $ok       = $result['ok'] ?? false;
+        $released = (float)($result['actual_released_amount'] ?? 0);
+        $noop     = (bool)($result['noop'] ?? false);
+
+        if ($ok && $released > 0) {
+            bv_seller_balance_log('pending_release_by_order_item_success', [
+                'seller_id'              => $result['seller_id']              ?? $sellerId,
+                'order_item_id'          => $orderItemId,
+                'currency'               => (string)($row['currency'] ?? $currency),
+                'actual_released_amount' => $released,
+                'shortfall'              => $result['shortfall'] ?? 0.0,
+                'debit_ledger_id'        => $result['debit_ledger_id']  ?? null,
+                'credit_ledger_id'       => $result['credit_ledger_id'] ?? null,
+            ]);
+            return true;
+        }
+
+        bv_seller_balance_log('pending_release_by_order_item_noop', [
+            'seller_id'     => $result['seller_id'] ?? $sellerId,
+            'order_item_id' => $orderItemId,
+            'currency'      => (string)($row['currency'] ?? $currency),
+            'ok'            => $ok,
+            'noop'          => $noop,
+            'message'       => $result['message'] ?? '',
+        ]);
         return false;
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public: release all eligible pending rows for one seller.
+// Returns a summary including actual released amounts and shortfalls.
+// ---------------------------------------------------------------------------
 if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
     function bv_seller_balance_release_pending_for_seller(int $sellerId, string $currency = 'USD'): array
     {
         if ($sellerId <= 0) {
             return [
-                'released_count' => 0,
+                'ok'              => false,
+                'released_count'  => 0,
                 'released_amount' => 0.0,
-                'skipped_count' => 0,
-                'errors' => ['Invalid seller_id'],
+                'skipped_count'   => 0,
+                'shortfall_count' => 0,
+                'shortfall_amount'=> 0.0,
+                'errors'          => ['Invalid seller_id'],
             ];
         }
- 
+
+        $pdo    = bv_seller_balance_pdo();
         $result = [
-            'released_count' => 0,
-            'released_amount' => 0.0,
-            'skipped_count' => 0,
-            'errors' => [],
+            'ok'               => true,
+            'released_count'   => 0,
+            'released_amount'  => 0.0,
+            'skipped_count'    => 0,
+            'shortfall_count'  => 0,
+            'shortfall_amount' => 0.0,
+            'errors'           => [],
         ];
+
         foreach (bv_seller_balance_find_releasable_ledger_rows($sellerId) as $row) {
-            if ($currency !== '' && strcasecmp((string)$row['currency'], $currency) !== 0) {
+            if ($currency !== '' && strcasecmp((string)($row['currency'] ?? ''), $currency) !== 0) {
                 $result['skipped_count']++;
                 continue;
             }
@@ -928,23 +1354,28 @@ if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
                 continue;
             }
             try {
-                // release_pending_for_row() returns the ACTUAL released amount (float).
-                // 0.0 means nothing was released (already done, shortfall = 0, error).
-                $actualReleased = bv_seller_balance_release_pending_for_row($row);
-                if ($actualReleased > 0) {
+                // Call the public row function so the full call chain is consistent.
+                $r = bv_seller_balance_release_pending_for_row($row);
+                $released = (float)($r['actual_released_amount'] ?? 0);
+                if ($r['noop'] ?? false) {
+                    $result['skipped_count']++;
+                } elseif (($r['ok'] ?? false) && $released > 0) {
                     $result['released_count']++;
-                    $result['released_amount'] = round((float)$result['released_amount'] + $actualReleased, 4);
-                    // Track shortfall if the actual amount is less than the source row amount.
-                    if ($actualReleased < $sourceAmount - 0.00005) {
-                        $result['shortfall_count'] = ($result['shortfall_count'] ?? 0) + 1;
+                    $result['released_amount'] = round(
+                        (float)$result['released_amount'] + $released, 4
+                    );
+                    $shortfall = (float)($r['shortfall'] ?? 0);
+                    if ($shortfall > 0.00005) {
+                        $result['shortfall_count']++;
                         $result['shortfall_amount'] = round(
-                            (float)($result['shortfall_amount'] ?? 0.0)
-                            + round($sourceAmount - $actualReleased, 4),
-                            4
+                            (float)$result['shortfall_amount'] + $shortfall, 4
                         );
                     }
                 } else {
                     $result['skipped_count']++;
+                    if (!empty($r['message']) && !($r['ok'] ?? true)) {
+                        $result['errors'][] = $r['message'];
+                    }
                 }
             } catch (Throwable $e) {
                 $result['skipped_count']++;
@@ -955,115 +1386,71 @@ if (!function_exists('bv_seller_balance_release_pending_for_seller')) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public: release one pending ledger row to available.
+//
+// Returns an array result — a non-empty array is always truthy, so existing
+// callers using `if (bv_seller_balance_release_pending_for_row($row))` still
+// work correctly (an ok=false result is also a non-empty array and truthy, so
+// callers that need to distinguish should check $result['ok'] and
+// $result['actual_released_amount'] > 0).
+//
+// Return keys:
+//   ok                    bool    — operation succeeded (incl. noop)
+//   noop                  bool    — nothing changed (already released / no pending)
+//   seller_id             int
+//   order_item_id         int
+//   source_amount         float   — net amount from ledger row
+//   actual_released_amount float  — amount actually moved pending→available
+//   shortfall             float   — source_amount − actual_released_amount
+//   debit_ledger_id       int|null
+//   credit_ledger_id      int|null
+//   balance               array|null — updated seller_balances snapshot
+//   message               string
+// ---------------------------------------------------------------------------
 if (!function_exists('bv_seller_balance_release_pending_for_row')) {
-    /**
-     * Release one pending row to available.
-     * Returns the actual amount released (float).
-     * Returns 0.0 when nothing was released (already done, shortfall = 0, error).
-     * Existing callers that test `if (bv_seller_balance_release_pending_for_row($row))` are unaffected
-     * because 0.0 is falsy and any positive float is truthy.
-     */
-    function bv_seller_balance_release_pending_for_row(array $row): float
+    function bv_seller_balance_release_pending_for_row(array $row): array
     {
-        $sellerId = (int)($row['seller_id'] ?? 0);
-        $orderItemId = (int)($row['order_item_id'] ?? 0);
-        $amount = round((float)($row['net_amount'] ?? 0), 4);
-        $currency = (string)($row['currency'] ?? 'USD');
-        if ($sellerId <= 0 || $orderItemId <= 0 || $amount <= 0) {
-            return 0.0; // invalid input
+        $sellerId    = (int)($row['seller_id']     ?? 0);
+        $orderItemId = (int)($row['order_item_id'] ?? $row['reference_id'] ?? 0);
+        $sourceAmt   = round((float)($row['net_amount'] ?? $row['amount'] ?? 0), 4);
+
+        $invalid = [
+            'ok'                     => false,
+            'noop'                   => true,
+            'seller_id'              => $sellerId,
+            'order_item_id'          => $orderItemId,
+            'source_amount'          => $sourceAmt,
+            'actual_released_amount' => 0.0,
+            'shortfall'              => 0.0,
+            'debit_ledger_id'        => null,
+            'credit_ledger_id'       => null,
+            'balance'                => null,
+            'message'                => 'Invalid input.',
+        ];
+
+        if ($sellerId <= 0 || $orderItemId <= 0 || $sourceAmt <= 0) {
+            return $invalid;
         }
 
         $pdo = bv_seller_balance_pdo();
-        $debitKey = 'pending_release_debit:' . $sellerId . ':' . $orderItemId;
-        $creditKey = 'pending_release_credit:' . $sellerId . ':' . $orderItemId;
-
         try {
-            $pdo->beginTransaction();
-            if (_bv_sb_ledger_exists($pdo, $debitKey) || _bv_sb_ledger_exists($pdo, $creditKey)) {
-                $pdo->rollBack();
-                return 0.0; // already released (idempotency)
-            }
-
-            $balRow = $pdo->prepare('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1 FOR UPDATE');
-            $balRow->execute([$sellerId]);
-            $balance = $balRow->fetch(PDO::FETCH_ASSOC);
-            if (!$balance) {
-                $pdo->rollBack();
-                return 0.0; // no balance row
-            }
-
-            $pendingNow = round((float)($balance['pending_balance'] ?? 0), 4);
-            $availableNow = round((float)($balance['available_balance'] ?? 0), 4);
-
-            // Anti-negative guard: log shortfall; cap release at what is available in pending.
-            if ($amount > $pendingNow + 0.00005) {
-                bv_seller_balance_log('pending_release_shortfall', [
-                    'seller_id'      => $sellerId,
-                    'order_item_id'  => $orderItemId,
-                    'requested'      => $amount,
-                    'pending_now'    => $pendingNow,
-                    'shortfall'      => round($amount - $pendingNow, 4),
-                ]);
-            }
-
-            $releaseAmt = round(min($amount, $pendingNow), 4);
-            if ($releaseAmt <= 0) {
-                $pdo->rollBack();
-                return 0.0; // nothing to release (pending is zero)
-            }
-
-            // Hard guard: ensures pending will not go negative after release.
-            _bv_sb_guard_no_negative($pendingNow, $releaseAmt, 'pending_release seller #' . $sellerId);
-
-            _bv_sb_insert_ledger_once($pdo, [
-                'seller_id' => $sellerId,
-                'type' => 'pending_release',
-                'balance_type' => 'pending',
-                'direction' => 'debit',
-                'amount' => $releaseAmt,
-                'currency' => $currency,
-                'balance_before' => $pendingNow,
-                'balance_after' => round($pendingNow - $releaseAmt, 4),
-                'reference_type' => 'order_item',
-                'reference_id' => $orderItemId,
-                'idempotency_key' => $debitKey,
-                'note' => 'Pending released for order item #' . $orderItemId,
-                'meta_json' => ['order_id' => (int)($row['order_id'] ?? 0), 'order_code' => (string)($row['order_code'] ?? '')],
-                'created_by_type' => 'system',
-            ]);
-
-            _bv_sb_insert_ledger_once($pdo, [
-                'seller_id' => $sellerId,
-                'type' => 'pending_release',
-                'balance_type' => 'available',
-                'direction' => 'credit',
-                'amount' => $releaseAmt,
-                'currency' => $currency,
-                'balance_before' => $availableNow,
-                'balance_after' => round($availableNow + $releaseAmt, 4),
-                'reference_type' => 'order_item',
-                'reference_id' => $orderItemId,
-                'idempotency_key' => $creditKey,
-                'note' => 'Pending released for order item #' . $orderItemId,
-                'meta_json' => ['order_id' => (int)($row['order_id'] ?? 0), 'order_code' => (string)($row['order_code'] ?? '')],
-                'created_by_type' => 'system',
-            ]);
-
-            $pdo->prepare(
-                'UPDATE seller_balances
-                 SET pending_balance = pending_balance - ?,
-                     available_balance = available_balance + ?
-                 WHERE seller_id = ?'
-            )->execute([$releaseAmt, $releaseAmt, $sellerId]);
-
-            $pdo->commit();
-            return $releaseAmt; // actual amount moved pending → available
+            return _bv_sb_release_one_row($pdo, $row);
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
-            error_log('[seller_balance] release_pending row failed: ' . $e->getMessage());
-            return 0.0;
+            error_log('[seller_balance] release_pending_for_row: ' . $e->getMessage());
+            return [
+                'ok'                     => false,
+                'noop'                   => false,
+                'seller_id'              => $sellerId,
+                'order_item_id'          => $orderItemId,
+                'source_amount'          => $sourceAmt,
+                'actual_released_amount' => 0.0,
+                'shortfall'              => 0.0,
+                'debit_ledger_id'        => null,
+                'credit_ledger_id'       => null,
+                'balance'                => null,
+                'message'                => $e->getMessage(),
+            ];
         }
     }
 }
