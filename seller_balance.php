@@ -2184,10 +2184,14 @@ if (!function_exists('bv_seller_balance_mark_payout_paid')) {
                 ]);
                 $pdo->prepare(
                     'UPDATE seller_balances
-                     SET held_balance     = held_balance     - :amt,
-                         paid_out_balance = paid_out_balance + :amt
+                     SET held_balance     = held_balance     - :held_amt,
+                         paid_out_balance = paid_out_balance + :paid_amt
                      WHERE seller_id = :sid'
-                )->execute([':amt' => $amount, ':sid' => $sellerId]);
+                )->execute([
+                    ':held_amt' => $amount,
+                    ':paid_amt' => $amount,
+                    ':sid'      => $sellerId,
+                ]);
             }
 
             // Best-effort transaction record — table may not exist in all environments.
